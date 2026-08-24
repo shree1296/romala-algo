@@ -6,13 +6,18 @@ and normalized return values. Uses the real Kotak Neo API exclusively.
 from __future__ import annotations
 
 import os
+import json
 import time
 import logging
-from typing import Any
+from typing import Any, Callable
 
 logger = logging.getLogger("romala.kotak")
 
-from neo_api_client import NeoAPI
+try:
+    from neo_api_client import NeoAPI
+except Exception as _import_err:
+    NeoAPI = None
+    logger.warning(f"neo_api_client not installed: {_import_err}")
 
 
 class KotakNeoClient:
@@ -35,12 +40,18 @@ class KotakNeoClient:
         self.user_info: dict[str, str] = {}
         self.credentials: dict[str, str] = {}
         self.consumer_key = os.getenv("NEO_CONSUMER_KEY", "")
+        self._tick_callbacks: list[Callable[[dict], None]] = []
 
     def login(self, credentials: dict[str, str]) -> dict[str, Any]:
         """Login to Kotak Neo with TOTP flow."""
         self.credentials = credentials
         self.consumer_key = credentials.get("consumer_key", self.consumer_key)
 
+        if NeoAPI is None:
+            raise RuntimeError(
+                "neo_api_client SDK is not installed. "
+                "Run: pip install git+https://github.com/Kotak-Neo/Kotak-neo-api-v2.git"
+            )
         try:
             self.client = NeoAPI(
                 environment="prod",
@@ -48,6 +59,8 @@ class KotakNeoClient:
                 neo_fin_key=None,
                 consumer_key=self.consumer_key,
             )
+            self.client.on_message = self._on_message
+            self.client.on_error = self._on_error
 
             # Session init
             self.client.session_init(
@@ -78,6 +91,43 @@ class KotakNeoClient:
             logger.error(f"Kotak Neo login failed: {e}")
             self.connected = False
             raise
+
+    def auto_login(self) -> dict[str, Any]:
+        """Auto-login using credentials from environment variables.
+
+        Reads NEO_MOBILE_NUMBER, NEO_PASSWORD, NEO_MPIN, NEO_TOTP_SECRET
+        from the environment. Generates the current TOTP code from the
+        secret key using pyotp, so no manual TOTP entry is needed.
+        """
+        import os
+        try:
+            import pyotp
+        except ImportError:
+            raise RuntimeError("pyotp is not installed. Run: pip install pyotp")
+
+        mobile = os.getenv("NEO_MOBILE_NUMBER", "")
+        password = os.getenv("NEO_PASSWORD", "")
+        mpin = os.getenv("NEO_MPIN", "")
+        totp_secret = os.getenv("NEO_TOTP_SECRET", "")
+
+        if not all([mobile, password, mpin, totp_secret]):
+            missing = [k for k, v in {
+                "NEO_MOBILE_NUMBER": mobile,
+                "NEO_PASSWORD": password,
+                "NEO_MPIN": mpin,
+                "NEO_TOTP_SECRET": totp_secret,
+            }.items() if not v]
+            raise RuntimeError(f"Auto-login missing env vars: {', '.join(missing)}")
+
+        totp_code = pyotp.TOTP(totp_secret).now()
+        logger.info("Auto-login: generated TOTP from secret key")
+
+        return self.login({
+            "mobile_number": mobile,
+            "password": password,
+            "mpin": mpin,
+            "totp": totp_code,
+        })
 
     def logout(self) -> dict[str, str]:
         if self.client and self.connected:
@@ -195,6 +245,30 @@ class KotakNeoClient:
             return {"margin_required": 0}
 
     # ─── WebSocket ───
+
+    def on_tick(self, callback: Callable[[dict], None]) -> None:
+        self._tick_callbacks.append(callback)
+
+    def off_tick(self, callback: Callable[[dict], None]) -> None:
+        if callback in self._tick_callbacks:
+            self._tick_callbacks.remove(callback)
+
+    def _on_message(self, message: Any) -> None:
+        if not message:
+            return
+        try:
+            data = json.loads(message) if isinstance(message, str) else message
+        except Exception:
+            data = message
+        logger.debug(f"Neo tick: {data}")
+        for cb in self._tick_callbacks:
+            try:
+                cb(data)
+            except Exception as e:
+                logger.warning(f"tick callback error: {e}")
+
+    def _on_error(self, error: Any) -> None:
+        logger.error(f"Neo WS error: {error}")
 
     def subscribe(self, instrument_tokens: list[dict], isIndex: bool = False, isDepth: bool = False) -> dict:
         try:
