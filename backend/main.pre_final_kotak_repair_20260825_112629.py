@@ -212,7 +212,6 @@ async def health():
 class LoginRequest(BaseModel):
     consumer_key: str = ""
     mobile_number: str = ""
-    ucc: str = ""
     password: str = ""
     mpin: str = ""
     totp: str = ""

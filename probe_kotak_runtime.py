@@ -1,1016 +1,445 @@
+"""
+ROMALA ALGO — KOTAK NEO SFEED FINAL CONTRACT PROBE
+
+READ-ONLY SDK FORENSIC INSPECTION.
+
+Does NOT:
+- modify repository files
+- modify .env
+- authenticate
+- open WebSocket
+- subscribe to market data
+- place/modify/cancel orders
+
+Purpose:
+Determine the exact runtime contract required to safely integrate
+neo_api_client 3.0.1 SFeedWebSocket into backend/kotak_neo/client.py.
+"""
+
 from __future__ import annotations
 
-import ast
-import asyncio
-import getpass
 import inspect
-import os
-import re
-import shutil
 import sys
-import time
 from pathlib import Path
 
-try:
-    from dotenv import load_dotenv
-except ImportError:
-    print("[FAIL] python-dotenv is not installed.")
-    print("Run: pip install python-dotenv")
-    raise SystemExit(1)
+
+SEP = "=" * 100
+SUB = "-" * 100
 
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-
-PROJECT_ROOT = Path(__file__).resolve().parent
-BACKEND_ROOT = PROJECT_ROOT / "backend"
-ENV_FILE = BACKEND_ROOT / ".env"
-
-BACKUP_ROOT = PROJECT_ROOT / "_kotak_v3_backups"
-
-MODIFY_FILES = True
-
-print("=" * 88)
-print("ROMALA ALGO — KOTAK NEO SDK V3 AUTHENTICATION + RUNTIME REPAIR")
-print("=" * 88)
-
-print(f"[INFO] Python       : {sys.executable}")
-print(f"[INFO] Project      : {PROJECT_ROOT}")
-print(f"[INFO] Backend      : {BACKEND_ROOT}")
-print(f"[INFO] Environment  : {ENV_FILE}")
-print()
-
-
-# =============================================================================
-# HELPERS
-# =============================================================================
-
-def mask(value: str, left: int = 3, right: int = 3) -> str:
-    value = str(value or "")
-
-    if not value:
-        return "<EMPTY>"
-
-    if len(value) <= left + right:
-        return "*" * len(value)
-
-    return value[:left] + ("*" * max(4, len(value) - left - right)) + value[-right:]
-
-
-def get_env(*names: str, required: bool = True) -> str | None:
-    for name in names:
-        value = os.getenv(name)
-
-        if value and value.strip():
-            return value.strip()
-
-    if required:
-        raise RuntimeError(
-            "Missing required environment variable. Expected one of: "
-            + ", ".join(names)
-        )
-
-    return None
-
-
-def is_current_totp(value: str) -> bool:
-    return bool(re.fullmatch(r"\d{6}", value or ""))
-
-
-def safe_backup(path: Path) -> Path:
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-
-    relative = path.relative_to(PROJECT_ROOT)
-
-    destination = (
-        BACKUP_ROOT
-        / timestamp
-        / relative
-    )
-
-    destination.parent.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    shutil.copy2(
-        path,
-        destination
-    )
-
-    return destination
-
-
-# =============================================================================
-# ENVIRONMENT
-# =============================================================================
-
-print("=" * 88)
-print("STEP 1 — LOAD ENVIRONMENT")
-print("=" * 88)
-
-if not BACKEND_ROOT.exists():
-    print(f"[FAIL] Backend directory not found: {BACKEND_ROOT}")
-    raise SystemExit(1)
-
-print("[PASS] Backend directory found.")
-
-if not ENV_FILE.exists():
-    print(f"[FAIL] .env file not found: {ENV_FILE}")
-    raise SystemExit(1)
-
-print(f"[PASS] Loading environment: {ENV_FILE}")
-
-load_dotenv(
-    ENV_FILE,
-    override=True
-)
-
-try:
-    CONSUMER_KEY = get_env(
-        "KOTAK_CONSUMER_KEY",
-        "KOTAK_API_KEY",
-        "NEO_CONSUMER_KEY"
-    )
-
-    MOBILE_NUMBER = get_env(
-        "KOTAK_MOBILE_NUMBER",
-        "KOTAK_MOBILE",
-        "NEO_MOBILE_NUMBER"
-    )
-
-    UCC = get_env(
-        "KOTAK_UCC",
-        "KOTAK_CLIENT_CODE",
-        "NEO_UCC"
-    )
-
-    MPIN = get_env(
-        "KOTAK_MPIN",
-        "NEO_MPIN"
-    )
-
-except Exception as exc:
-    print(f"[FAIL] Environment configuration error: {exc}")
-    raise SystemExit(1)
-
-print()
-print("[PASS] Consumer Key :", mask(CONSUMER_KEY))
-print("[PASS] Mobile       :", mask(MOBILE_NUMBER, 2, 2))
-print("[PASS] UCC          :", mask(UCC, 2, 2))
-print("[PASS] MPIN         :", mask(MPIN, 2, 2))
-
-
-# =============================================================================
-# TOTP INPUT
-# =============================================================================
-
-print()
-print("=" * 88)
-print("STEP 2 — ENTER CURRENT TOTP")
-print("=" * 88)
-
-print()
-print("[IMPORTANT]")
-print("Enter the CURRENT 6-digit code shown by your authenticator.")
-print("Do NOT enter:")
-print("  - a redacted value")
-print("  - RE********TP")
-print("  - a placeholder")
-print("  - a stale code")
-print()
-print("The code is requested at runtime and is NOT written to .env.")
-print()
-
-CURRENT_TOTP = getpass.getpass(
-    "Current Kotak Authenticator TOTP: "
-).strip()
-
-if not is_current_totp(CURRENT_TOTP):
+def section(title: str) -> None:
     print()
-    print("[FAIL] Invalid TOTP format.")
-    print("[INFO] Expected exactly 6 digits.")
-    raise SystemExit(1)
-
-print("[PASS] Valid 6-digit TOTP format received.")
+    print(SEP)
+    print(title)
+    print(SEP)
 
 
-# =============================================================================
-# SDK IMPORT
-# =============================================================================
-
-print()
-print("=" * 88)
-print("STEP 3 — IMPORT KOTAK NEO SDK")
-print("=" * 88)
-
-try:
-    import neo_api_client
-    from neo_api_client import NeoAPI
-
-except Exception as exc:
-    print("[FAIL] Could not import neo_api_client.")
-    print(f"[ERROR] {exc}")
-    raise SystemExit(1)
-
-sdk_version = getattr(
-    neo_api_client,
-    "__version__",
-    "UNKNOWN"
-)
-
-print("[PASS] neo_api_client imported.")
-print(f"[INFO] SDK version: {sdk_version}")
-
-print()
-print("[INFO] NeoAPI constructor:")
-print(inspect.signature(NeoAPI))
+def subsection(title: str) -> None:
+    print()
+    print(SUB)
+    print(title)
+    print(SUB)
 
 
-# =============================================================================
-# REPOSITORY LEGACY API SCAN
-# =============================================================================
-
-print()
-print("=" * 88)
-print("STEP 4 — SCAN BACKEND FOR LEGACY KOTAK SDK CALLS")
-print("=" * 88)
-
-LEGACY_PATTERNS = {
-    "session_init": re.compile(
-        r"\.\s*session_init\s*\("
-    ),
-
-    "legacy_callback_subscribe": re.compile(
-        r"\.\s*subscribe\s*\("
-    ),
-
-    "legacy_callback_unsubscribe": re.compile(
-        r"\.\s*un_subscribe\s*\("
-    ),
-}
-
-matches = []
-
-for path in BACKEND_ROOT.rglob("*.py"):
+def safe_source(obj, label: str) -> None:
+    subsection(f"SOURCE — {label}")
 
     try:
-        source = path.read_text(
-            encoding="utf-8"
+        source = inspect.getsource(obj)
+        lines = source.splitlines()
+
+        print(f"[INFO] Total source lines: {len(lines)}")
+
+        for index, line in enumerate(lines, start=1):
+            print(f"{index:04d}: {line}")
+
+    except Exception as exc:
+        print(f"[WARN] Could not retrieve source: {exc}")
+
+
+def inspect_callable(obj, label: str) -> None:
+    subsection(f"CALLABLE — {label}")
+
+    try:
+        print(f"[INFO] Object    : {obj}")
+    except Exception:
+        pass
+
+    try:
+        print(f"[INFO] Module    : {obj.__module__}")
+    except Exception:
+        pass
+
+    try:
+        print(f"[INFO] Signature : {inspect.signature(obj)}")
+    except Exception as exc:
+        print(f"[WARN] Signature unavailable: {exc}")
+
+    try:
+        print(f"[INFO] Source    : {inspect.getsourcefile(obj)}")
+    except Exception:
+        pass
+
+
+def main() -> int:
+
+    section("ROMALA ALGO — KOTAK NEO SFEED FINAL CONTRACT PROBE")
+
+    print("[SAFETY] READ-ONLY forensic inspection.")
+    print("[SAFETY] No repository files will be modified.")
+    print("[SAFETY] No .env file will be modified.")
+    print("[SAFETY] No authentication API will be called.")
+    print("[SAFETY] No WebSocket connection will be opened.")
+    print("[SAFETY] No market-data subscription will be performed.")
+    print("[SAFETY] No order API will be called.")
+
+    section("1. PYTHON RUNTIME")
+
+    print(f"[INFO] Python  : {sys.executable}")
+    print(f"[INFO] Version : {sys.version}")
+
+    section("2. SDK IMPORT")
+
+    try:
+        import neo_api_client
+
+        print("[PASS] neo_api_client imported.")
+        print(
+            "[INFO] SDK version: "
+            f"{getattr(neo_api_client, '__version__', 'UNKNOWN')}"
         )
-    except UnicodeDecodeError:
-        source = path.read_text(
-            encoding="utf-8",
-            errors="replace"
+        print(f"[INFO] SDK path   : {neo_api_client.__file__}")
+
+    except Exception as exc:
+        print(f"[FAIL] neo_api_client import failed: {exc}")
+        return 1
+
+    section("3. IMPORT SFEED COMPONENTS")
+
+    try:
+        from neo_api_client.websocket.feed import (
+            SFeedWebSocket,
+            WsToken,
         )
 
-    lines = source.splitlines()
+        print("[PASS] SFeedWebSocket imported.")
+        print("[PASS] WsToken imported.")
 
-    for index, line in enumerate(
-        lines,
-        start=1
+    except Exception as exc:
+        print(f"[FAIL] SFeed imports failed: {exc}")
+        return 1
+
+    section("4. SFEED WEBSOCKET CLASS")
+
+    print(f"[INFO] Class  : {SFeedWebSocket}")
+    print(f"[INFO] Module : {SFeedWebSocket.__module__}")
+
+    try:
+        print(
+            "[INFO] Source : "
+            f"{inspect.getsourcefile(SFeedWebSocket)}"
+        )
+    except Exception:
+        pass
+
+    try:
+        print(
+            "[INFO] Constructor: "
+            f"{inspect.signature(SFeedWebSocket)}"
+        )
+    except Exception as exc:
+        print(f"[WARN] Constructor signature unavailable: {exc}")
+
+    section("5. COMPLETE PUBLIC METHOD INVENTORY")
+
+    methods = []
+
+    for name, member in inspect.getmembers(
+        SFeedWebSocket,
+        predicate=callable,
     ):
-        for name, pattern in LEGACY_PATTERNS.items():
+        if not name.startswith("__"):
+            methods.append(name)
 
-            if pattern.search(line):
+    if methods:
+        for name in methods:
+            try:
+                member = getattr(SFeedWebSocket, name)
+                signature = inspect.signature(member)
 
-                matches.append(
-                    {
-                        "type": name,
-                        "file": path,
-                        "line": index,
-                        "source": line.strip()
-                    }
-                )
+                print(f"[METHOD] {name}{signature}")
 
-if not matches:
-
-    print("[PASS] No known legacy Kotak SDK patterns found.")
-
-else:
-
-    print(
-        f"[WARNING] Found {len(matches)} "
-        f"legacy SDK reference(s)."
-    )
-
-    for item in matches:
-
-        relative = item["file"].relative_to(
-            PROJECT_ROOT
-        )
+            except Exception:
+                print(f"[METHOD] {name} (signature unavailable)")
 
         print()
-        print(
-            f"[FOUND] {item['type']}"
-        )
+        print(f"[INFO] Total public callable methods: {len(methods)}")
 
-        print(
-            f"  File : {relative}"
-        )
+    else:
+        print("[WARN] No public callable methods discovered.")
 
-        print(
-            f"  Line : {item['line']}"
-        )
+    section("6. ASYNC LIFECYCLE CONTRACT")
 
-        print(
-            f"  Code : {item['source']}"
-        )
+    lifecycle_names = [
+        "__aenter__",
+        "__aexit__",
+        "__aiter__",
+        "__anext__",
+        "connect",
+        "disconnect",
+        "close",
+        "start",
+        "stop",
+        "run",
+    ]
 
+    for name in lifecycle_names:
 
-# =============================================================================
-# SAFE session_init REPAIR
-# =============================================================================
+        member = getattr(SFeedWebSocket, name, None)
 
-print()
-print("=" * 88)
-print("STEP 5 — SAFE session_init() REPAIR")
-print("=" * 88)
-
-print()
-print(
-    "[INFO] Only standalone calls such as "
-    "'neo.session_init()' will be removed automatically."
-)
-
-print(
-    "[INFO] Complex expressions or assigned return values "
-    "will NOT be modified."
-)
-
-repaired_files = []
-manual_review = []
-
-for path in BACKEND_ROOT.rglob("*.py"):
-
-    try:
-        source = path.read_text(
-            encoding="utf-8"
-        )
-    except UnicodeDecodeError:
-        source = path.read_text(
-            encoding="utf-8",
-            errors="replace"
-        )
-
-    original_source = source
-    lines = source.splitlines(
-        keepends=True
-    )
-
-    changed = False
-    output = []
-
-    for line_number, line in enumerate(
-        lines,
-        start=1
-    ):
-
-        stripped = line.strip()
-
-        standalone_match = re.fullmatch(
-            r"(?P<indent>\s*)"
-            r"(?P<object>[A-Za-z_][A-Za-z0-9_]*)"
-            r"\.session_init\(\)\s*"
-            r"(?:#.*)?"
-            r"(?:\r?\n)?",
-            line
-        )
-
-        if standalone_match:
-
-            indent = standalone_match.group(
-                "indent"
-            )
-
-            object_name = standalone_match.group(
-                "object"
-            )
-
-            output.append(
-                indent
-                + "# Removed legacy Kotak SDK v2 "
-                + f"session_init() call for {object_name}.\n"
-            )
-
-            output.append(
-                indent
-                + "# SDK v3 authentication begins with "
-                + "totp_login() followed by totp_validate().\n"
-            )
-
-            changed = True
-
-            print(
-                "[SAFE REPAIR] "
-                f"{path.relative_to(PROJECT_ROOT)}"
-                f":{line_number}"
-            )
-
+        if member is None:
+            print(f"[MISS] {name}")
             continue
 
-        if ".session_init(" in line:
+        print(f"[PASS] {name}")
 
-            manual_review.append(
-                (
-                    path,
-                    line_number,
-                    line.strip()
-                )
-            )
-
-        output.append(line)
-
-    if changed:
-
-        if MODIFY_FILES:
-
-            backup = safe_backup(path)
-
-            path.write_text(
-                "".join(output),
-                encoding="utf-8"
-            )
-
-            print(
-                f"[PASS] Backup created: "
-                f"{backup.relative_to(PROJECT_ROOT)}"
-            )
-
-            print(
-                f"[PASS] Repaired: "
-                f"{path.relative_to(PROJECT_ROOT)}"
-            )
-
-            repaired_files.append(path)
-
-        else:
-
-            print(
-                "[INFO] Dry run only — no file modified."
-            )
-
-if not repaired_files:
-
-    print(
-        "[INFO] No standalone session_init() calls required repair."
-    )
-
-if manual_review:
-
-    print()
-    print(
-        "[WARNING] Complex session_init references require review."
-    )
-
-    for path, line_number, code in manual_review:
-
-        print()
-        print(
-            f"  {path.relative_to(PROJECT_ROOT)}"
-            f":{line_number}"
+        inspect_callable(
+            member,
+            f"SFeedWebSocket.{name}",
         )
 
-        print(
-            f"    {code}"
+        safe_source(
+            member,
+            f"SFeedWebSocket.{name}",
         )
 
-else:
+    section("7. SUBSCRIPTION CONTRACT")
 
-    print(
-        "[PASS] No complex session_init usage found."
-    )
+    subscription_names = [
+        "subscribe_scrips",
+        "unsubscribe_scrips",
+        "subscribe",
+        "unsubscribe",
+    ]
 
+    for name in subscription_names:
 
-# =============================================================================
-# PYTHON SYNTAX VALIDATION
-# =============================================================================
+        member = getattr(SFeedWebSocket, name, None)
 
-print()
-print("=" * 88)
-print("STEP 6 — VALIDATE MODIFIED PYTHON FILES")
-print("=" * 88)
+        if member is None:
+            print(f"[MISS] {name}")
+            continue
 
-syntax_failures = []
+        print(f"[PASS] {name}")
 
-for path in repaired_files:
+        inspect_callable(
+            member,
+            f"SFeedWebSocket.{name}",
+        )
+
+        safe_source(
+            member,
+            f"SFeedWebSocket.{name}",
+        )
+
+    section("8. WsToken CONTRACT")
+
+    print(f"[INFO] WsToken class: {WsToken}")
 
     try:
-
-        source = path.read_text(
-            encoding="utf-8"
-        )
-
-        ast.parse(
-            source,
-            filename=str(path)
-        )
-
         print(
-            f"[PASS] Syntax valid: "
-            f"{path.relative_to(PROJECT_ROOT)}"
+            "[INFO] Constructor: "
+            f"{inspect.signature(WsToken)}"
         )
-
     except Exception as exc:
+        print(f"[WARN] Signature unavailable: {exc}")
 
-        syntax_failures.append(
-            (
-                path,
-                exc
-            )
-        )
+    safe_source(
+        WsToken,
+        "WsToken",
+    )
+
+    section("9. MESSAGE MODEL DISCOVERY")
+
+    try:
+        import neo_api_client.websocket.feed.models as models
 
         print(
-            f"[FAIL] Syntax error: "
-            f"{path.relative_to(PROJECT_ROOT)}"
+            "[INFO] Models module: "
+            f"{getattr(models, '__file__', 'UNKNOWN')}"
         )
 
-        print(
-            f"[ERROR] {exc}"
-        )
-
-if syntax_failures:
-
-    print()
-    print(
-        "[CRITICAL] Syntax failures detected after repair."
-    )
-
-    raise SystemExit(1)
-
-
-# =============================================================================
-# CREATE SDK CLIENT
-# =============================================================================
-
-print()
-print("=" * 88)
-print("STEP 7 — CREATE KOTAK NEO V3 CLIENT")
-print("=" * 88)
-
-try:
-
-    neo = NeoAPI(
-        consumer_key=CONSUMER_KEY,
-        environment="prod"
-    )
-
-    print("[PASS] NeoAPI client created.")
-
-except Exception as exc:
-
-    print("[FAIL] NeoAPI creation failed.")
-    print(f"[ERROR] {exc}")
-
-    raise SystemExit(1)
-
-
-# =============================================================================
-# TOTP LOGIN
-# =============================================================================
-
-print()
-print("=" * 88)
-print("STEP 8 — TOTP LOGIN")
-print("=" * 88)
-
-mobile_number = MOBILE_NUMBER.strip()
-
-if not mobile_number.startswith("+"):
-
-    mobile_number = "+91" + mobile_number
-
-try:
-
-    login_response = neo.totp_login(
-        mobile_number=mobile_number,
-        ucc=UCC.strip(),
-        totp=CURRENT_TOTP
-    )
-
-except Exception as exc:
-
-    print("[FAIL] totp_login() raised an exception.")
-    print(f"[ERROR] {type(exc).__name__}: {exc}")
-
-    try:
-        neo.logout()
-    except Exception:
-        pass
-
-    raise SystemExit(1)
-
-print(
-    f"[INFO] Response type: "
-    f"{type(login_response).__name__}"
-)
-
-if not isinstance(login_response, dict):
-
-    print("[FAIL] Unexpected TOTP login response.")
-    print(login_response)
-
-    raise SystemExit(1)
-
-if login_response.get("error"):
-
-    print("[FAIL] Kotak rejected TOTP login.")
-    print(f"[ERROR RESPONSE] {login_response['error']}")
-
-    try:
-        neo.logout()
-    except Exception:
-        pass
-
-    raise SystemExit(1)
-
-login_data = login_response.get(
-    "data",
-    {}
-)
-
-login_status = login_data.get(
-    "status"
-)
-
-print(
-    f"[INFO] Login status: "
-    f"{login_status}"
-)
-
-if str(login_status).lower() != "success":
-
-    print("[FAIL] TOTP login did not succeed.")
-    print(f"[RESPONSE] {login_response}")
-
-    try:
-        neo.logout()
-    except Exception:
-        pass
-
-    raise SystemExit(1)
-
-print("[PASS] TOTP login succeeded.")
-
-
-# =============================================================================
-# MPIN VALIDATION
-# =============================================================================
-
-print()
-print("=" * 88)
-print("STEP 9 — MPIN VALIDATION")
-print("=" * 88)
-
-try:
-
-    validation_response = neo.totp_validate(
-        mpin=MPIN.strip()
-    )
-
-except Exception as exc:
-
-    print("[FAIL] totp_validate() raised an exception.")
-    print(f"[ERROR] {type(exc).__name__}: {exc}")
-
-    try:
-        neo.logout()
-    except Exception:
-        pass
-
-    raise SystemExit(1)
-
-print(
-    f"[INFO] Response type: "
-    f"{type(validation_response).__name__}"
-)
-
-if not isinstance(validation_response, dict):
-
-    print("[FAIL] Unexpected MPIN validation response.")
-    print(validation_response)
-
-    try:
-        neo.logout()
-    except Exception:
-        pass
-
-    raise SystemExit(1)
-
-if validation_response.get("error"):
-
-    print("[FAIL] Kotak rejected MPIN validation.")
-    print(
-        f"[ERROR RESPONSE] "
-        f"{validation_response['error']}"
-    )
-
-    try:
-        neo.logout()
-    except Exception:
-        pass
-
-    raise SystemExit(1)
-
-validation_data = validation_response.get(
-    "data",
-    {}
-)
-
-validation_status = validation_data.get(
-    "status"
-)
-
-print(
-    f"[INFO] Validation status: "
-    f"{validation_status}"
-)
-
-if str(validation_status).lower() != "success":
-
-    print(
-        "[FAIL] MPIN validation did not succeed."
-    )
-
-    print(
-        f"[RESPONSE] "
-        f"{validation_response}"
-    )
-
-    try:
-        neo.logout()
-    except Exception:
-        pass
-
-    raise SystemExit(1)
-
-print(
-    "[PASS] MPIN validation succeeded."
-)
-
-print()
-
-for field in (
-    "ucc",
-    "greetingName",
-    "baseUrl",
-    "dataCenter",
-    "kType",
-):
-
-    value = validation_data.get(field)
-
-    if value:
-
-        if field in (
-            "baseUrl",
+        discovered = []
+
+        for name, obj in inspect.getmembers(
+            models,
+            inspect.isclass,
         ):
-            print(
-                f"[INFO] {field}: available"
-            )
-        else:
-            print(
-                f"[INFO] {field}: {value}"
-            )
+            if obj.__module__ == models.__name__:
+                discovered.append((name, obj))
 
+        if not discovered:
+            print("[WARN] No SDK model classes discovered.")
 
-# =============================================================================
-# QUOTE CONTRACT INSPECTION
-# =============================================================================
+        for name, obj in discovered:
 
-print()
-print("=" * 88)
-print("STEP 10 — AUTHENTICATED REST CONTRACT")
-print("=" * 88)
+            print()
+            print(f"[MODEL] {name}")
 
-try:
+            try:
+                print(
+                    "[INFO] Constructor: "
+                    f"{inspect.signature(obj)}"
+                )
+            except Exception:
+                pass
 
-    print(
-        "[INFO] quotes signature:"
-    )
+            try:
+                annotations = getattr(
+                    obj,
+                    "__annotations__",
+                    {},
+                )
 
-    print(
-        inspect.signature(
-            neo.quotes
-        )
-    )
+                if annotations:
+                    print("[FIELDS]")
 
-    print(
-        "[PASS] Authenticated NeoAPI object is available."
-    )
+                    for field_name, field_type in annotations.items():
+                        print(
+                            f"  - {field_name}: {field_type}"
+                        )
 
-except Exception as exc:
-
-    print(
-        "[WARNING] Could not inspect quotes contract."
-    )
-
-    print(
-        f"[ERROR] {exc}"
-    )
-
-
-# =============================================================================
-# MODERN SFEED WEBSOCKET PROBE
-# =============================================================================
-
-print()
-print("=" * 88)
-print("STEP 11 — MODERN SFEED WEBSOCKET PROBE")
-print("=" * 88)
-
-print()
-print(
-    "[INFO] SDK v3 uses async SFeed WebSocket."
-)
-
-print(
-    "[INFO] This probe creates the authenticated WebSocket object."
-)
-
-print(
-    "[INFO] It does NOT place, modify, or cancel orders."
-)
-
-
-async def websocket_probe():
-
-    try:
-
-        websocket = neo.create_websocket()
-
-        print(
-            "[PASS] create_websocket() returned:"
-        )
-
-        print(
-            f"       {type(websocket).__module__}."
-            f"{type(websocket).__name__}"
-        )
-
-        has_async_context = (
-            hasattr(
-                websocket,
-                "__aenter__"
-            )
-            and hasattr(
-                websocket,
-                "__aexit__"
-            )
-        )
-
-        has_async_iterator = (
-            hasattr(
-                websocket,
-                "__aiter__"
-            )
-        )
-
-        print(
-            f"[INFO] Async context manager: "
-            f"{has_async_context}"
-        )
-
-        print(
-            f"[INFO] Async iterator: "
-            f"{has_async_iterator}"
-        )
-
-        return True
+            except Exception as exc:
+                print(
+                    f"[WARN] Could not inspect annotations: {exc}"
+                )
 
     except Exception as exc:
+        print(f"[WARN] Model discovery failed: {exc}")
 
-        print(
-            "[FAIL] create_websocket() failed."
+    section("10. INTERNAL STATE / CONNECTION ATTRIBUTES")
+
+    try:
+        class_annotations = getattr(
+            SFeedWebSocket,
+            "__annotations__",
+            {},
         )
 
-        print(
-            f"[ERROR] {type(exc).__name__}: {exc}"
+        if class_annotations:
+            print("[INFO] Class annotations:")
+
+            for key, value in class_annotations.items():
+                print(f"  - {key}: {value}")
+
+        else:
+            print(
+                "[INFO] No class-level annotations found."
+            )
+
+    except Exception as exc:
+        print(f"[WARN] State inspection failed: {exc}")
+
+    section("11. FULL CLASS SOURCE")
+
+    safe_source(
+        SFeedWebSocket,
+        "SFeedWebSocket",
+    )
+
+    section("12. NEOAPI CREATE_WEBSOCKET SOURCE")
+
+    try:
+        from neo_api_client import NeoAPI
+
+        inspect_callable(
+            NeoAPI.create_websocket,
+            "NeoAPI.create_websocket",
         )
 
-        return False
+        safe_source(
+            NeoAPI.create_websocket,
+            "NeoAPI.create_websocket",
+        )
 
+    except Exception as exc:
+        print(
+            f"[WARN] Could not inspect NeoAPI.create_websocket: {exc}"
+        )
 
-try:
+    section("13. FINAL DECISION MATRIX")
 
-    websocket_ok = asyncio.run(
-        websocket_probe()
-    )
+    checks = {
+        "async context manager":
+            hasattr(SFeedWebSocket, "__aenter__")
+            and hasattr(SFeedWebSocket, "__aexit__"),
 
-except Exception as exc:
+        "async iterator":
+            hasattr(SFeedWebSocket, "__aiter__")
+            and hasattr(SFeedWebSocket, "__anext__"),
 
-    print(
-        "[FAIL] WebSocket probe runtime failure."
-    )
+        "subscribe_scrips":
+            hasattr(SFeedWebSocket, "subscribe_scrips"),
 
-    print(
-        f"[ERROR] {type(exc).__name__}: {exc}"
-    )
+        "WsToken available":
+            WsToken is not None,
+    }
 
-    websocket_ok = False
+    for name, passed in checks.items():
 
+        status = "[PASS]" if passed else "[FAIL]"
 
-# =============================================================================
-# LOGOUT
-# =============================================================================
+        print(f"{status} {name}")
 
-print()
-print("=" * 88)
-print("STEP 12 — CLEAN LOGOUT")
-print("=" * 88)
-
-try:
-
-    neo.logout()
-
-    print("[PASS] Logout completed.")
-
-except Exception as exc:
+    section("14. EXPECTED NEXT REPAIR")
 
     print(
-        "[WARNING] Logout raised:"
-    )
-
-    print(
-        f"[WARNING] {type(exc).__name__}: {exc}"
-    )
-
-
-# =============================================================================
-# FINAL RESULT
-# =============================================================================
-
-print()
-print("=" * 88)
-print("FINAL RESULT")
-print("=" * 88)
-
-print(
-    f"Legacy files repaired : "
-    f"{len(repaired_files)}"
-)
-
-print(
-    f"WebSocket object      : "
-    f"{'PASS' if websocket_ok else 'FAIL'}"
-)
-
-if websocket_ok:
-
-    print()
-    print(
-        "[PASS] Kotak Neo v3 authentication and "
-        "WebSocket object creation succeeded."
+        "If the contract above confirms the expected lifecycle, "
+        "the next production repair will implement:"
     )
 
     print()
-    print(
-        "[NEXT STEP] Start the Romala Algo backend and test:"
-    )
-
-    print()
-
-    print(
-        "POST http://localhost:8000/api/broker/login"
-    )
-
-    print()
-
-    print(
-        "[IMPORTANT] The backend login implementation must use:"
-    )
-
-    print(
-        "1. NeoAPI(consumer_key=...)"
-    )
-
-    print(
-        "2. totp_login(...)"
-    )
-
-    print(
-        "3. totp_validate(...)"
-    )
-
-    print(
-        "4. No session_init()"
-    )
-
-    print(
-        "5. Modern async SFeed integration"
-    )
-
-else:
+    print("    authenticated NeoAPI")
+    print("            ↓")
+    print("    create_websocket()")
+    print("            ↓")
+    print("    retain SFeedWebSocket instance")
+    print("            ↓")
+    print("    async connection task")
+    print("            ↓")
+    print("    subscribe_scrips([WsToken(...)])")
+    print("            ↓")
+    print("    async message consumer")
+    print("            ↓")
+    print("    SDK message → project tick dict")
+    print("            ↓")
+    print("    existing on_tick() callbacks")
 
     print()
     print(
-        "[STOP] Do not assume streaming is fixed yet."
+        "[INFO] This probe does NOT perform the repair."
     )
+
+    section("END OF SFEED FINAL CONTRACT PROBE")
 
     print(
-        "Authentication or WebSocket creation still requires investigation."
+        "[SAFETY] No authentication attempted."
+    )
+    print(
+        "[SAFETY] No WebSocket opened."
+    )
+    print(
+        "[SAFETY] No subscription performed."
+    )
+    print(
+        "[SAFETY] No repository files modified."
+    )
+    print(
+        "[SAFETY] No order operation performed."
     )
 
-print()
-print("=" * 88)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

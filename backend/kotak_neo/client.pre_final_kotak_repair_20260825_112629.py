@@ -180,88 +180,41 @@ class KotakNeoClient:
         }
 
     def auto_login(self) -> dict[str, Any]:
-        """Authenticate using the current Kotak environment contract.
+        """Auto-login using credentials from environment variables.
 
-        Required environment variables:
-
-            KOTAK_CONSUMER_KEY
-            KOTAK_MOBILE_NUMBER
-            KOTAK_UCC
-            KOTAK_MPIN
-            KOTAK_TOTP
-
-        KOTAK_TOTP may be either:
-
-        1. A current six-digit authenticator code, or
-        2. A valid Base32 TOTP secret.
-
-        If a Base32 secret is supplied, pyotp generates the current
-        six-digit code locally.
-
-        No order operation is performed here.
+        Reads NEO_MOBILE_NUMBER, NEO_PASSWORD, NEO_MPIN, NEO_TOTP_SECRET
+        from the environment. Generates the current TOTP code from the
+        secret key using pyotp, so no manual TOTP entry is needed.
         """
+        import os
+        try:
+            import pyotp
+        except ImportError:
+            raise RuntimeError("pyotp is not installed. Run: pip install pyotp")
 
-        consumer_key = os.getenv("KOTAK_CONSUMER_KEY", "").strip()
-        mobile = os.getenv("KOTAK_MOBILE_NUMBER", "").strip()
-        ucc = os.getenv("KOTAK_UCC", "").strip()
-        mpin = os.getenv("KOTAK_MPIN", "").strip()
-        totp_value = os.getenv("KOTAK_TOTP", "").strip()
+        mobile = os.getenv("NEO_MOBILE_NUMBER", "")
+        password = os.getenv("NEO_PASSWORD", "")
+        mpin = os.getenv("NEO_MPIN", "")
+        totp_secret = os.getenv("NEO_TOTP_SECRET", "")
 
-        values = {
-            "KOTAK_CONSUMER_KEY": consumer_key,
-            "KOTAK_MOBILE_NUMBER": mobile,
-            "KOTAK_UCC": ucc,
-            "KOTAK_MPIN": mpin,
-            "KOTAK_TOTP": totp_value,
-        }
+        if not all([mobile, password, mpin, totp_secret]):
+            missing = [k for k, v in {
+                "NEO_MOBILE_NUMBER": mobile,
+                "NEO_PASSWORD": password,
+                "NEO_MPIN": mpin,
+                "NEO_TOTP_SECRET": totp_secret,
+            }.items() if not v]
+            raise RuntimeError(f"Auto-login missing env vars: {', '.join(missing)}")
 
-        missing = [
-            name
-            for name, value in values.items()
-            if not value
-        ]
-
-        if missing:
-            raise RuntimeError(
-                "Auto-login missing environment variables: "
-                + ", ".join(missing)
-            )
-
-        if totp_value.isdigit() and len(totp_value) == 6:
-            totp_code = totp_value
-
-        else:
-            try:
-                import pyotp
-            except ImportError as exc:
-                raise RuntimeError(
-                    "KOTAK_TOTP is not a six-digit OTP and pyotp is "
-                    "required to generate a TOTP from a valid Base32 secret. "
-                    "Install with: pip install pyotp"
-                ) from exc
-
-            try:
-                totp_code = pyotp.TOTP(
-                    totp_value.replace(" ", "").upper()
-                ).now()
-            except Exception as exc:
-                raise RuntimeError(
-                    "KOTAK_TOTP is neither a valid six-digit OTP nor "
-                    "a valid Base32 TOTP secret."
-                ) from exc
-
-        logger.info(
-            "Kotak auto-login prepared using KOTAK_* credentials."
-        )
+        totp_code = pyotp.TOTP(totp_secret).now()
+        logger.info("Auto-login: generated TOTP from secret key")
 
         return self.login({
-            "consumer_key": consumer_key,
             "mobile_number": mobile,
-            "ucc": ucc,
+            "password": password,
             "mpin": mpin,
             "totp": totp_code,
         })
-
 
     def logout(self) -> dict[str, str]:
         if self.client and self.connected:
