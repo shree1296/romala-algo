@@ -38,6 +38,43 @@ app.add_middleware(
 neo = KotakNeoClient()
 START_TIME = time.time()
 
+# ─── Connected WebSocket clients (for live tick broadcast) ───
+_active_ws_clients: list[WebSocket] = []
+import asyncio
+
+
+def _broadcast_tick(tick: dict) -> None:
+    """Forward a Kotak Neo tick to every connected WS client.
+
+    Called from the Neo SDK's background thread, so we schedule the
+    async sends on the running event loop rather than awaiting directly.
+    """
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        return
+    dead: list[WebSocket] = []
+    for ws in _active_ws_clients:
+        if ws.client_state.name != "CONNECTED":
+            dead.append(ws)
+            continue
+        try:
+            loop.call_soon_threadsafe(
+                asyncio.ensure_future,
+                ws.send_json({"type": "tick", "data": tick}),
+            )
+        except Exception as e:
+            logger.warning(f"broadcast tick send failed: {e}")
+            dead.append(ws)
+    for ws in dead:
+        if ws in _active_ws_clients:
+            _active_ws_clients.remove(ws)
+
+
+# Register our broadcast as the tick callback so the Neo SDK pushes
+# every live tick through to all connected frontend WebSocket clients.
+neo.on_tick(_broadcast_tick)
+
 # ─── Real NSE instrument tokens for watchlist/quotes ───
 NSE_SYMBOLS = [
     {"symbol": "NIFTY", "exchange": "nse_cm", "token": "256265", "isIndex": True},
@@ -236,9 +273,11 @@ async def get_quote(symbol: str, exchange: str = "nse_cm"):
 
 @app.get("/api/market-status")
 async def market_status():
-    now = time.localtime()
-    hour, minute = now.tm_hour, now.tm_min
-    day = now.tm_wday
+    from datetime import datetime, timezone, timedelta
+    ist = timezone(timedelta(hours=5, minutes=30))
+    now = datetime.now(ist)
+    hour, minute = now.hour, now.minute
+    day = now.weekday()  # Monday=0 .. Sunday=6
     is_weekday = 0 <= day <= 4
     total_min = hour * 60 + minute
     is_open = is_weekday and 555 <= total_min <= 930
@@ -258,6 +297,7 @@ async def market_status():
         "timestamp": int(time.time() * 1000),
         "next_open": "09:15",
         "next_close": "15:30",
+        "ist_time": now.strftime("%H:%M:%S"),
     }
 
 
@@ -543,6 +583,7 @@ async def get_limits(segment: str = "ALL", exchange: str = "ALL", product: str =
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
+    _active_ws_clients.append(websocket)
     try:
         while True:
             data = await websocket.receive_json()
@@ -557,10 +598,16 @@ async def websocket_endpoint(websocket: WebSocket):
                 tokens = data.get("symbols", [])
                 if neo.connected:
                     neo.unsubscribe(tokens)
+                await websocket.send_json({"type": "connection", "data": {"status": "unsubscribed", "count": len(tokens)}})
+            elif msg_type == "ping":
+                await websocket.send_json({"type": "pong", "data": {"ts": int(time.time() * 1000)}})
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected")
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
+    finally:
+        if websocket in _active_ws_clients:
+            _active_ws_clients.remove(websocket)
 
 
 if __name__ == "__main__":

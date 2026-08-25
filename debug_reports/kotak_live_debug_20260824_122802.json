@@ -1,0 +1,55 @@
+{
+  "generated_at": "2026-08-24T06:58:02.892086+00:00",
+  "project_root": "C:\\Users\\Romala\\romala-algo",
+  "python": {
+    "executable": "C:\\Users\\Romala\\romala-algo\\.venv\\Scripts\\python.exe",
+    "version": "3.11.9 (tags/v3.11.9:de54cf5, Apr  2 2024, 10:12:12) [MSC v.1938 64 bit (AMD64)]",
+    "prefix": "C:\\Users\\Romala\\romala-algo\\.venv",
+    "base_prefix": "C:\\Users\\Romala\\AppData\\Local\\Programs\\Python\\Python311"
+  },
+  "sdk_version": "3.0.1",
+  "results": [
+    {
+      "name": "Virtual environment",
+      "status": "OK",
+      "message": "C:\\Users\\Romala\\romala-algo\\.venv",
+      "details": null,
+      "timestamp": "2026-08-24T06:57:51.613416+00:00"
+    },
+    {
+      "name": "Modern SFeed WebSocket",
+      "status": "OK",
+      "message": "create_websocket() is available.",
+      "details": null,
+      "timestamp": "2026-08-24T06:57:52.253898+00:00"
+    },
+    {
+      "name": "Backend port",
+      "status": "OK",
+      "message": "127.0.0.1:8000 is listening.",
+      "details": null,
+      "timestamp": "2026-08-24T06:57:52.834404+00:00"
+    },
+    {
+      "name": "Credentials",
+      "status": "WARNING",
+      "message": "Credentials are placeholders. Authenticated live-data tests cannot run.",
+      "details": null,
+      "timestamp": "2026-08-24T06:57:52.835404+00:00"
+    },
+    {
+      "name": "Application /api/quotes",
+      "status": "FAILED",
+      "message": "No quote request returned HTTP 200.",
+      "details": null,
+      "timestamp": "2026-08-24T06:57:52.868404+00:00"
+    },
+    {
+      "name": "Application WebSocket messages",
+      "status": "WARNING",
+      "message": "WebSocket connected but no messages were received.",
+      "details": null,
+      "timestamp": "2026-08-24T06:58:02.890085+00:00"
+    }
+  ]
+}
