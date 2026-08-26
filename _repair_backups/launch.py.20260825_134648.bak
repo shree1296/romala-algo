@@ -1092,68 +1092,6 @@ def show_process_status() -> None:
 
 
 # ============================================================================
-# PROCESS TREE TERMINATION
-# ============================================================================
-
-def terminate_process_tree(
-    process: subprocess.Popen,
-    name: str,
-) -> bool:
-    """
-    Terminate a process and all of its child processes.
-
-    This is particularly important on Windows because npm, Vite,
-    and some server launchers can create child processes.
-    """
-
-    if process.poll() is not None:
-        return True
-
-    if os.name == "nt":
-
-        info(
-            f"Stopping Windows process tree for {name} "
-            f"(PID {process.pid})..."
-        )
-
-        try:
-
-            result = subprocess.run(
-                [
-                    "taskkill",
-                    "/PID",
-                    str(process.pid),
-                    "/T",
-                    "/F",
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-
-            if result.returncode == 0:
-
-                success(
-                    f"{name} process tree stopped."
-                )
-
-                return True
-
-            warning(
-                f"taskkill returned {result.returncode}: "
-                f"{result.stderr.strip()}"
-            )
-
-        except Exception as exc:
-
-            warning(
-                f"Could not terminate process tree: {exc}"
-            )
-
-    return False
-
-
-# ============================================================================
 # SHUTDOWN
 # ============================================================================
 
@@ -1169,12 +1107,6 @@ def terminate_process(
         f"Stopping {name} process "
         f"(PID {process.pid})..."
     )
-
-    if terminate_process_tree(
-        process,
-        name,
-    ):
-        return
 
     try:
 

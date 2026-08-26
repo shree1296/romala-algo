@@ -24,3 +24,9 @@ dist-ssr
 
 # Local Kotak Neo credentials
 backend/.env
+
+.venv/
+
+__pycache__/
+
+*.backup_*

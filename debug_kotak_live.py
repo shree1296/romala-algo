@@ -1,743 +1,887 @@
+"""
+KOTAK LIVE PIPELINE DEEP VALIDATION
+===================================
+
+Performs runtime inspection without connecting to Kotak.
+
+Validates:
+
+1. TickNormalizer public API discovery
+2. TickNormalizer callable methods
+3. WebsocketManager public API discovery
+4. LiveDataPipeline public API discovery
+5. Source-level import/wiring relationships
+6. LIVE_QUOTES runtime ownership
+7. Synthetic normalized quote update
+8. Duplicate quote-store detection
+9. Startup candidate discovery
+
+This script does NOT:
+- connect to Kotak
+- authenticate
+- subscribe to WebSocket
+- place orders
+
+Run:
+
+    python kotak_pipeline_deep_validation.py
+"""
+
 from __future__ import annotations
 
-import base64
-import os
-import re
+import ast
+import importlib
+import inspect
+import json
 import sys
+import traceback
+from datetime import datetime
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
-
-import pyotp
-from dotenv import load_dotenv
 
 
-# =============================================================================
-# ROMALA ALGO — KOTAK NEO TOTP + AUTHENTICATION DIAGNOSTIC
-#
-# SAFETY:
-# - Read-only authentication diagnostics
-# - No orders
-# - No modify orders
-# - No cancel orders
-# - No portfolio changes
-# =============================================================================
+# ============================================================
+# PROJECT ROOT
+# ============================================================
 
+def find_project_root() -> Path:
 
-print("=" * 80)
-print("ROMALA ALGO — KOTAK NEO TOTP + AUTHENTICATION DIAGNOSTIC")
-print("=" * 80)
+    candidates = []
 
+    cwd = Path.cwd().resolve()
 
-# =============================================================================
-# PROJECT PATHS
-# =============================================================================
+    candidates.append(cwd)
+    candidates.extend(cwd.parents)
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-BACKEND_ROOT = PROJECT_ROOT / "backend"
-ENV_FILE = BACKEND_ROOT / ".env"
+    script_dir = Path(__file__).resolve().parent
 
-print(f"[INFO] Python      : {sys.executable}")
-print(f"[INFO] Project     : {PROJECT_ROOT}")
-print(f"[INFO] Backend     : {BACKEND_ROOT}")
-print(f"[INFO] Environment : {ENV_FILE}")
+    candidates.append(script_dir)
+    candidates.extend(script_dir.parents)
 
+    for candidate in candidates:
 
-# =============================================================================
-# LOAD ENVIRONMENT
-# =============================================================================
-
-if not ENV_FILE.exists():
-    raise RuntimeError(
-        f"Environment file not found:\n{ENV_FILE}"
-    )
-
-print(f"[INFO] Loading environment: {ENV_FILE}")
-
-load_dotenv(
-    dotenv_path=ENV_FILE,
-    override=True,
-)
-
-
-# =============================================================================
-# ENVIRONMENT HELPERS
-# =============================================================================
-
-def get_required_env(*names: str) -> str:
-    """
-    Return the first configured environment variable.
-
-    Raises a clear error if none exist.
-    """
-
-    for name in names:
-        value = os.getenv(name)
-
-        if value is not None:
-            value = value.strip()
-
-            if value:
-                return value
+        if (candidate / "backend").is_dir():
+            return candidate
 
     raise RuntimeError(
-        "Missing required environment variable. "
-        f"Expected one of: {', '.join(names)}"
+        "Could not locate project root containing backend/"
     )
 
 
-def mask(value: str, left: int = 3, right: int = 3) -> str:
-    """
-    Safely mask secrets.
-    """
+PROJECT_ROOT = find_project_root()
+BACKEND = PROJECT_ROOT / "backend"
 
-    if not value:
-        return "<EMPTY>"
-
-    if len(value) <= left + right:
-        return "*" * len(value)
-
-    return (
-        value[:left]
-        + "*" * max(4, len(value) - left - right)
-        + value[-right:]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(
+        0,
+        str(PROJECT_ROOT),
     )
 
 
-# =============================================================================
-# LOAD KOTAK CONFIGURATION
-# =============================================================================
+# ============================================================
+# REPORT
+# ============================================================
 
-CONSUMER_KEY = get_required_env(
-    "KOTAK_CONSUMER_KEY",
-    "KOTAK_API_KEY",
-    "NEO_CONSUMER_KEY",
-)
-
-MOBILE_NUMBER = get_required_env(
-    "KOTAK_MOBILE_NUMBER",
-    "KOTAK_MOBILE",
-    "NEO_MOBILE_NUMBER",
-)
-
-UCC = get_required_env(
-    "KOTAK_UCC",
-    "NEO_UCC",
-)
-
-MPIN = get_required_env(
-    "KOTAK_MPIN",
-    "NEO_MPIN",
-)
-
-TOTP_VALUE = get_required_env(
-    "KOTAK_TOTP",
-    "NEO_TOTP",
-    "KOTAK_TOTP_SECRET",
-)
+report = {
+    "generated_at": datetime.now().isoformat(),
+    "project_root": str(PROJECT_ROOT),
+    "summary": {},
+    "checks": [],
+    "apis": {},
+    "startup_candidates": [],
+    "duplicate_quote_files": [],
+    "errors": [],
+}
 
 
-print()
-print("=" * 80)
-print("KOTAK CONFIGURATION")
-print("=" * 80)
+def add_check(
+    name: str,
+    status: str,
+    details: str,
+):
 
-print(f"[OK] Consumer Key : {mask(CONSUMER_KEY)}")
-print(f"[OK] Mobile       : {mask(MOBILE_NUMBER, 2, 2)}")
-print(f"[OK] UCC          : {mask(UCC, 2, 2)}")
-print(f"[OK] MPIN         : {mask(MPIN, 2, 2)}")
-print(f"[OK] TOTP         : {mask(TOTP_VALUE, 2, 2)}")
+    report["checks"].append(
+        {
+            "name": name,
+            "status": status,
+            "details": details,
+        }
+    )
+
+    print(f"[{status}] {name}")
+    print(f"    {details}")
 
 
-# =============================================================================
-# TOTP FORMAT DIAGNOSTICS
-# =============================================================================
+def add_error(
+    name: str,
+    exc: Exception,
+):
 
-def diagnose_totp(value: str) -> dict:
-    """
-    Safely diagnose a TOTP value.
+    report["errors"].append(
+        {
+            "name": name,
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+    )
 
-    Supported input:
+    print(f"[ERROR] {name}")
+    print(f"    {exc}")
 
-    1. Current 6-digit OTP:
-       123456
 
-    2. Base32 TOTP secret:
-       JBSWY3DPEHPK3PXP
+def get_public_methods(
+    obj,
+):
 
-    3. otpauth URI:
-       otpauth://totp/Example?secret=JBSWY3DPEHPK3PXP
-    """
+    methods = []
 
-    result = {
-        "original_length": 0,
-        "input_type": None,
-        "normalized_length": 0,
-        "valid": False,
-        "secret": None,
-        "reason": None,
-    }
-
-    raw = (value or "").strip()
-
-    result["original_length"] = len(raw)
-
-    if not raw:
-        result["reason"] = "TOTP value is empty."
-        return result
-
-    # -------------------------------------------------------------------------
-    # CASE 1 — CURRENT 6 DIGIT OTP
-    # -------------------------------------------------------------------------
-
-    if re.fullmatch(r"\d{6}", raw):
-        result["input_type"] = "LIVE_OTP"
-        result["normalized_length"] = 6
-        result["valid"] = True
-        result["secret"] = raw
-        result["reason"] = (
-            "Input is already a 6-digit current OTP."
-        )
-
-        return result
-
-    # -------------------------------------------------------------------------
-    # CASE 2 — OTpauth URI
-    # -------------------------------------------------------------------------
-
-    if raw.lower().startswith("otpauth://"):
-        result["input_type"] = "OTPAUTH_URI"
-
-        try:
-            parsed = urlparse(raw)
-            params = parse_qs(parsed.query)
-
-            secret_values = params.get("secret", [])
-
-            if not secret_values:
-                result["reason"] = (
-                    "otpauth URI does not contain a secret parameter."
-                )
-
-                return result
-
-            raw = secret_values[0].strip()
-
-        except Exception as exc:
-            result["reason"] = (
-                f"Unable to parse otpauth URI: {exc}"
-            )
-
-            return result
-
-    # -------------------------------------------------------------------------
-    # NORMALIZE SECRET
-    # -------------------------------------------------------------------------
-
-    normalized = raw
-
-    # Remove spaces
-    normalized = normalized.replace(" ", "")
-
-    # Remove hyphens
-    normalized = normalized.replace("-", "")
-
-    # Remove quotes
-    normalized = normalized.replace('"', "")
-    normalized = normalized.replace("'", "")
-
-    # Remove common accidental prefixes
-    for prefix in (
-        "SECRET:",
-        "SECRET=",
-        "TOTP:",
-        "TOTP=",
-        "KOTAK_TOTP=",
-        "KOTAK_TOTP:",
+    for name, member in inspect.getmembers(
+        obj,
     ):
-        if normalized.upper().startswith(prefix):
-            normalized = normalized[len(prefix):]
 
-    normalized = normalized.strip().upper()
+        if name.startswith("_"):
+            continue
 
-    # Remove Base32 padding temporarily
-    normalized_without_padding = normalized.rstrip("=")
+        if callable(member):
 
-    result["normalized_length"] = len(
-        normalized_without_padding
-    )
+            methods.append(name)
 
-    if result["input_type"] is None:
-        result["input_type"] = "BASE32_SECRET"
+    return methods
 
-    # -------------------------------------------------------------------------
-    # BASE32 CHARACTER VALIDATION
-    #
-    # Valid characters:
-    # A-Z
-    # 2-7
-    # Optional =
-    # -------------------------------------------------------------------------
 
-    if not re.fullmatch(
-        r"[A-Z2-7]+",
-        normalized_without_padding,
-    ):
-        invalid_chars = sorted(
-            set(
-                ch
-                for ch in normalized_without_padding
-                if ch not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
-            )
-        )
-
-        result["reason"] = (
-            "Value contains characters that are not valid "
-            "in a Base32 TOTP secret. "
-            f"Invalid characters detected: "
-            f"{''.join(invalid_chars) if invalid_chars else '<unknown>'}"
-        )
-
-        return result
-
-    # -------------------------------------------------------------------------
-    # BASE32 DECODE VALIDATION
-    # -------------------------------------------------------------------------
+def read_file(
+    path: Path,
+) -> str:
 
     try:
 
-        padded = normalized_without_padding
+        return path.read_text(
+            encoding="utf-8",
+            errors="ignore",
+        )
 
-        missing_padding = (
-            -len(padded)
-        ) % 8
+    except Exception:
 
-        padded += "=" * missing_padding
+        return ""
 
-        base64.b32decode(
-            padded,
-            casefold=True,
+
+# ============================================================
+# HEADER
+# ============================================================
+
+print()
+print("=" * 70)
+print("KOTAK LIVE PIPELINE DEEP VALIDATION")
+print("=" * 70)
+print()
+
+print(
+    f"[INFO] Project root: {PROJECT_ROOT}"
+)
+
+
+# ============================================================
+# IMPORT MODULES
+# ============================================================
+
+MODULE_NAMES = [
+    "backend.market.live_quotes",
+    "backend.market.tick_normalizer",
+    "backend.market.websocket_manager",
+    "backend.market.live_data_pipeline",
+    "backend.broker.kotak.kotak_neo_client",
+]
+
+modules = {}
+
+for module_name in MODULE_NAMES:
+
+    try:
+
+        module = importlib.import_module(
+            module_name
+        )
+
+        modules[module_name] = module
+
+        add_check(
+            f"Import {module_name}",
+            "PASS",
+            "Imported successfully",
         )
 
     except Exception as exc:
 
-        result["reason"] = (
-            f"Base32 validation failed: {exc}"
+        add_error(
+            f"Import {module_name}",
+            exc,
         )
 
-        return result
 
-    # -------------------------------------------------------------------------
-    # PYOTP VALIDATION
-    # -------------------------------------------------------------------------
+# ============================================================
+# LOAD COMPONENTS
+# ============================================================
+
+if not report["errors"]:
 
     try:
 
-        totp = pyotp.TOTP(
-            normalized_without_padding
+        live_quotes_module = modules[
+            "backend.market.live_quotes"
+        ]
+
+        normalizer_module = modules[
+            "backend.market.tick_normalizer"
+        ]
+
+        websocket_module = modules[
+            "backend.market.websocket_manager"
+        ]
+
+        pipeline_module = modules[
+            "backend.market.live_data_pipeline"
+        ]
+
+        LIVE_QUOTES = getattr(
+            live_quotes_module,
+            "LIVE_QUOTES",
         )
 
-        generated = totp.now()
+        update_live_quote = getattr(
+            live_quotes_module,
+            "update_live_quote",
+        )
 
-        if not re.fullmatch(
-            r"\d{6}",
-            generated,
+        clear_live_quotes = getattr(
+            live_quotes_module,
+            "clear_live_quotes",
+        )
+
+        TickNormalizer = getattr(
+            normalizer_module,
+            "TickNormalizer",
+        )
+
+        WebsocketManager = getattr(
+            websocket_module,
+            "WebsocketManager",
+        )
+
+        LiveDataPipeline = getattr(
+            pipeline_module,
+            "LiveDataPipeline",
+        )
+
+        add_check(
+            "Core runtime symbols",
+            "PASS",
+            (
+                "All required live pipeline "
+                "components loaded"
+            ),
+        )
+
+    except Exception as exc:
+
+        add_error(
+            "Core runtime symbols",
+            exc,
+        )
+
+
+# ============================================================
+# TICK NORMALIZER API DISCOVERY
+# ============================================================
+
+normalizer = None
+
+if not report["errors"]:
+
+    try:
+
+        normalizer = TickNormalizer()
+
+        methods = get_public_methods(
+            normalizer
+        )
+
+        report["apis"]["TickNormalizer"] = {
+            "methods": methods,
+        }
+
+        print()
+        print("-" * 70)
+        print("TickNormalizer PUBLIC METHODS")
+        print("-" * 70)
+
+        if methods:
+
+            for method in methods:
+                print(f"  - {method}")
+
+            add_check(
+                "TickNormalizer API",
+                "PASS",
+                (
+                    f"Discovered {len(methods)} "
+                    "public callable method(s)"
+                ),
+            )
+
+        else:
+
+            add_check(
+                "TickNormalizer API",
+                "PARTIAL",
+                (
+                    "No public callable methods found"
+                ),
+            )
+
+    except Exception as exc:
+
+        add_error(
+            "TickNormalizer API",
+            exc,
+        )
+
+
+# ============================================================
+# WEBSOCKET MANAGER API DISCOVERY
+# ============================================================
+
+if not report["errors"]:
+
+    try:
+
+        manager = WebsocketManager()
+
+        methods = get_public_methods(
+            manager
+        )
+
+        report["apis"]["WebsocketManager"] = {
+            "methods": methods,
+        }
+
+        print()
+        print("-" * 70)
+        print("WebsocketManager PUBLIC METHODS")
+        print("-" * 70)
+
+        if methods:
+
+            for method in methods:
+                print(f"  - {method}")
+
+            add_check(
+                "WebsocketManager API",
+                "PASS",
+                (
+                    f"Discovered {len(methods)} "
+                    "public callable method(s)"
+                ),
+            )
+
+        else:
+
+            add_check(
+                "WebsocketManager API",
+                "PARTIAL",
+                (
+                    "No public callable methods found"
+                ),
+            )
+
+    except Exception as exc:
+
+        add_error(
+            "WebsocketManager API",
+            exc,
+        )
+
+
+# ============================================================
+# LIVE DATA PIPELINE API DISCOVERY
+# ============================================================
+
+if not report["errors"]:
+
+    try:
+
+        pipeline = LiveDataPipeline()
+
+        methods = get_public_methods(
+            pipeline
+        )
+
+        report["apis"]["LiveDataPipeline"] = {
+            "methods": methods,
+        }
+
+        print()
+        print("-" * 70)
+        print("LiveDataPipeline PUBLIC METHODS")
+        print("-" * 70)
+
+        if methods:
+
+            for method in methods:
+                print(f"  - {method}")
+
+            add_check(
+                "LiveDataPipeline API",
+                "PASS",
+                (
+                    f"Discovered {len(methods)} "
+                    "public callable method(s)"
+                ),
+            )
+
+        else:
+
+            add_check(
+                "LiveDataPipeline API",
+                "PARTIAL",
+                (
+                    "No public callable methods found"
+                ),
+            )
+
+    except Exception as exc:
+
+        add_error(
+            "LiveDataPipeline API",
+            exc,
+        )
+
+
+# ============================================================
+# LIVE QUOTE RUNTIME VALIDATION
+# ============================================================
+
+if not report["errors"]:
+
+    try:
+
+        clear_live_quotes()
+
+        synthetic_normalized_tick = {
+            "exchange": "nse_fo",
+            "token": "SMOKE_001",
+            "symbol": "NIFTY_SMOKE_TEST",
+            "ltp": 25000.50,
+            "timestamp": datetime.now().isoformat(),
+            "source": "smoke_test",
+        }
+
+        update_live_quote(
+            synthetic_normalized_tick
+        )
+
+        expected_key = (
+            "nse_fo|SMOKE_001"
+        )
+
+        if expected_key not in LIVE_QUOTES:
+
+            raise RuntimeError(
+                "Synthetic quote missing from "
+                "LIVE_QUOTES"
+            )
+
+        cached_quote = LIVE_QUOTES[
+            expected_key
+        ]
+
+        if (
+            cached_quote.get("ltp")
+            != 25000.50
         ):
-            result["reason"] = (
-                "pyotp generated an unexpected OTP format."
+
+            raise RuntimeError(
+                "Cached LTP validation failed"
             )
 
-            return result
+        add_check(
+            "LIVE_QUOTES ownership",
+            "PASS",
+            (
+                "Synthetic normalized tick successfully "
+                "stored in central quote cache"
+            ),
+        )
 
     except Exception as exc:
 
-        result["reason"] = (
-            f"pyotp rejected the TOTP secret: {exc}"
+        add_error(
+            "LIVE_QUOTES ownership",
+            exc,
         )
 
-        return result
 
-    result["valid"] = True
-    result["secret"] = normalized_without_padding
-    result["reason"] = (
-        "Valid Base32 TOTP secret."
+# ============================================================
+# SOURCE-LEVEL WIRING VALIDATION
+# ============================================================
+
+SOURCE_CHECKS = [
+    (
+        BACKEND
+        / "market"
+        / "websocket_manager.py",
+        "TickNormalizer",
+        "WebsocketManager -> TickNormalizer",
+    ),
+    (
+        BACKEND
+        / "market"
+        / "websocket_manager.py",
+        "update_live_quote",
+        "WebsocketManager -> update_live_quote",
+    ),
+    (
+        BACKEND
+        / "market"
+        / "live_data_pipeline.py",
+        "WebsocketManager",
+        "LiveDataPipeline -> WebsocketManager",
+    ),
+]
+
+
+for file_path, symbol, check_name in SOURCE_CHECKS:
+
+    try:
+
+        content = read_file(
+            file_path
+        )
+
+        if symbol in content:
+
+            add_check(
+                check_name,
+                "PASS",
+                (
+                    f"{symbol} reference found in "
+                    f"{file_path.name}"
+                ),
+            )
+
+        else:
+
+            add_check(
+                check_name,
+                "PARTIAL",
+                (
+                    f"{symbol} reference NOT found in "
+                    f"{file_path.name}"
+                ),
+            )
+
+    except Exception as exc:
+
+        add_error(
+            check_name,
+            exc,
+        )
+
+
+# ============================================================
+# DUPLICATE LIVE QUOTE STORE DETECTION
+# ============================================================
+
+try:
+
+    quote_files = []
+
+    for path in BACKEND.rglob("*.py"):
+
+        if path.name == "live_quotes.py":
+
+            quote_files.append(
+                str(
+                    path.relative_to(
+                        PROJECT_ROOT
+                    )
+                )
+            )
+
+    report[
+        "duplicate_quote_files"
+    ] = quote_files
+
+    if len(quote_files) == 1:
+
+        add_check(
+            "Single LIVE_QUOTES module",
+            "PASS",
+            quote_files[0],
+        )
+
+    elif len(quote_files) > 1:
+
+        add_check(
+            "Single LIVE_QUOTES module",
+            "PARTIAL",
+            (
+                "Multiple live_quotes.py files found: "
+                + ", ".join(quote_files)
+            ),
+        )
+
+    else:
+
+        add_check(
+            "Single LIVE_QUOTES module",
+            "MISSING",
+            "No live_quotes.py found",
+        )
+
+except Exception as exc:
+
+    add_error(
+        "Single LIVE_QUOTES module",
+        exc,
     )
 
-    return result
 
+# ============================================================
+# STARTUP FILE DISCOVERY
+# ============================================================
 
-# =============================================================================
-# STEP 1 — DIAGNOSE TOTP
-# =============================================================================
+STARTUP_NAMES = {
+    "main.py",
+    "app.py",
+    "server.py",
+    "startup.py",
+    "run.py",
+}
+
+startup_candidates = []
+
+for path in PROJECT_ROOT.rglob("*.py"):
+
+    if ".venv" in path.parts:
+        continue
+
+    if "__pycache__" in path.parts:
+        continue
+
+    if path.name in STARTUP_NAMES:
+
+        relative_path = str(
+            path.relative_to(
+                PROJECT_ROOT
+            )
+        )
+
+        startup_candidates.append(
+            relative_path
+        )
+
+report[
+    "startup_candidates"
+] = startup_candidates
+
 
 print()
-print("=" * 80)
-print("STEP 1 — TOTP FORMAT DIAGNOSTIC")
-print("=" * 80)
+print("-" * 70)
+print("STARTUP CANDIDATES")
+print("-" * 70)
 
+if startup_candidates:
 
-diagnosis = diagnose_totp(TOTP_VALUE)
+    for candidate in startup_candidates:
+        print(f"  - {candidate}")
 
-print(
-    f"[INFO] Original length   : "
-    f"{diagnosis['original_length']}"
-)
-
-print(
-    f"[INFO] Input type        : "
-    f"{diagnosis['input_type']}"
-)
-
-print(
-    f"[INFO] Normalized length : "
-    f"{diagnosis['normalized_length']}"
-)
-
-print(
-    f"[INFO] Diagnosis         : "
-    f"{diagnosis['reason']}"
-)
-
-
-if not diagnosis["valid"]:
-
-    print()
-    print("[FAIL] KOTAK_TOTP FORMAT IS INVALID")
-
-    print()
-    print("Your backend/.env must contain ONE of these formats:")
-
-    print()
-    print("OPTION 1 — CURRENT 6-DIGIT OTP")
-    print("KOTAK_TOTP=123456")
-
-    print()
-    print("OPTION 2 — BASE32 AUTHENTICATOR SECRET")
-    print("KOTAK_TOTP=JBSWY3DPEHPK3PXP")
-
-    print()
-    print("OPTION 3 — OTPAUTH URI")
-    print(
-        "KOTAK_TOTP="
-        "otpauth://totp/Kotak?secret=JBSWY3DPEHPK3PXP"
-    )
-
-    print()
-    print("[IMPORTANT]")
-    print(
-        "Do NOT put a redacted value such as "
-        "RE********TP into the .env file."
-    )
-
-    print(
-        "The actual unmasked TOTP secret or current "
-        "6-digit OTP must be present."
-    )
-
-    print()
-    print(
-        "[STOP] Kotak authentication will not be attempted."
-    )
-
-    raise SystemExit(1)
-
-
-# =============================================================================
-# RESOLVE CURRENT OTP
-# =============================================================================
-
-print()
-print("=" * 80)
-print("STEP 2 — RESOLVE CURRENT TOTP")
-print("=" * 80)
-
-
-if diagnosis["input_type"] == "LIVE_OTP":
-
-    CURRENT_TOTP = diagnosis["secret"]
-
-    print(
-        "[INFO] Using provided current 6-digit OTP."
+    add_check(
+        "Startup discovery",
+        "PASS",
+        (
+            f"Found {len(startup_candidates)} "
+            "startup candidate(s)"
+        ),
     )
 
 else:
 
-    secret = diagnosis["secret"]
-
-    totp_generator = pyotp.TOTP(secret)
-
-    CURRENT_TOTP = totp_generator.now()
-
-    remaining = (
-        totp_generator.interval
-        - (
-            __import__("time").time()
-            % totp_generator.interval
-        )
-    )
-
-    print(
-        "[PASS] Generated current OTP from Base32 secret."
-    )
-
-    print(
-        f"[INFO] OTP preview: "
-        f"{CURRENT_TOTP[:2]}****"
-    )
-
-    print(
-        f"[INFO] Approx seconds before refresh: "
-        f"{int(remaining)}"
+    add_check(
+        "Startup discovery",
+        "PARTIAL",
+        (
+            "No standard startup file name found"
+        ),
     )
 
 
-# =============================================================================
-# IMPORT KOTAK SDK
-# =============================================================================
+# ============================================================
+# CHECK STARTUP REFERENCES
+# ============================================================
 
-print()
-print("=" * 80)
-print("STEP 3 — IMPORT KOTAK NEO SDK")
-print("=" * 80)
+pipeline_references = []
 
+for relative_path in startup_candidates:
 
-try:
+    path = PROJECT_ROOT / relative_path
 
-    import neo_api_client
-    from neo_api_client import NeoAPI
-
-    print("[PASS] neo_api_client imported.")
-
-    print(
-        "[INFO] SDK version: "
-        f"{getattr(neo_api_client, '__version__', 'not exposed')}"
+    content = read_file(
+        path
     )
 
-except Exception as exc:
+    references = []
 
-    print("[FAIL] Unable to import neo_api_client.")
-    print(f"[ERROR] {exc}")
+    for symbol in [
+        "LiveDataPipeline",
+        "WebsocketManager",
+        "KotakNeoClient",
+    ]:
 
-    raise SystemExit(1)
+        if symbol in content:
+            references.append(symbol)
 
+    if references:
 
-# =============================================================================
-# CREATE CLIENT
-# =============================================================================
-
-print()
-print("=" * 80)
-print("STEP 4 — CREATE NEOAPI CLIENT")
-print("=" * 80)
-
-
-try:
-
-    neo = NeoAPI(
-        consumer_key=CONSUMER_KEY,
-        environment="prod",
-    )
-
-    print("[PASS] NeoAPI client created.")
-
-except Exception as exc:
-
-    print("[FAIL] NeoAPI client creation failed.")
-    print(f"[ERROR] {exc}")
-
-    raise SystemExit(1)
-
-
-# =============================================================================
-# NORMALIZE MOBILE NUMBER
-# =============================================================================
-
-mobile_number = (
-    MOBILE_NUMBER
-    .replace(" ", "")
-    .replace("-", "")
-)
-
-if mobile_number.startswith("+91"):
-    pass
-
-elif mobile_number.startswith("91") and len(mobile_number) == 12:
-    mobile_number = "+" + mobile_number
-
-elif len(mobile_number) == 10:
-    mobile_number = "+91" + mobile_number
-
-print()
-print(
-    f"[INFO] Normalized mobile: "
-    f"{mask(mobile_number, 3, 2)}"
-)
-
-
-# =============================================================================
-# STEP 5 — TOTP LOGIN
-# =============================================================================
-
-print()
-print("=" * 80)
-print("STEP 5 — KOTAK TOTP LOGIN")
-print("=" * 80)
-
-
-try:
-
-    login_response = neo.totp_login(
-        mobile_number=mobile_number,
-        ucc=UCC.strip(),
-        totp=CURRENT_TOTP,
-    )
-
-    print(
-        f"[INFO] Response type: "
-        f"{type(login_response).__name__}"
-    )
-
-    print(
-        f"[INFO] Response: "
-        f"{login_response}"
-    )
-
-    if not isinstance(login_response, dict):
-
-        raise RuntimeError(
-            "Unexpected TOTP login response type."
+        pipeline_references.append(
+            {
+                "file": relative_path,
+                "references": references,
+            }
         )
 
-    if login_response.get("error"):
 
-        raise RuntimeError(
-            "Kotak TOTP login rejected: "
-            f"{login_response.get('error')}"
+report[
+    "startup_pipeline_references"
+] = pipeline_references
+
+
+if pipeline_references:
+
+    details = []
+
+    for item in pipeline_references:
+
+        details.append(
+            (
+                f"{item['file']}: "
+                + ", ".join(
+                    item["references"]
+                )
+            )
         )
 
-    print(
-        "[PASS] TOTP login returned without an error."
+    add_check(
+        "Startup pipeline references",
+        "PASS",
+        "; ".join(details),
     )
 
-except Exception as exc:
+else:
 
-    print()
-    print("[FAIL] KOTAK TOTP LOGIN FAILED")
-    print(f"[ERROR] {exc}")
-
-    try:
-        neo.logout()
-    except Exception:
-        pass
-
-    raise SystemExit(1)
-
-
-# =============================================================================
-# STEP 6 — MPIN VALIDATION
-# =============================================================================
-
-print()
-print("=" * 80)
-print("STEP 6 — KOTAK MPIN VALIDATION")
-print("=" * 80)
-
-
-try:
-
-    validation_response = neo.totp_validate(
-        mpin=MPIN.strip(),
+    add_check(
+        "Startup pipeline references",
+        "PARTIAL",
+        (
+            "Startup files found but no direct "
+            "LiveDataPipeline/WebsocketManager/"
+            "KotakNeoClient references detected"
+        ),
     )
 
-    print(
-        f"[INFO] Response type: "
-        f"{type(validation_response).__name__}"
-    )
 
-    print(
-        f"[INFO] Response: "
-        f"{validation_response}"
-    )
+# ============================================================
+# SUMMARY
+# ============================================================
 
-    if not isinstance(validation_response, dict):
-
-        raise RuntimeError(
-            "Unexpected MPIN validation response type."
-        )
-
-    if validation_response.get("error"):
-
-        raise RuntimeError(
-            "Kotak MPIN validation rejected: "
-            f"{validation_response.get('error')}"
-        )
-
-    print(
-        "[PASS] MPIN validation returned without an error."
-    )
-
-except Exception as exc:
-
-    print()
-    print("[FAIL] KOTAK MPIN VALIDATION FAILED")
-    print(f"[ERROR] {exc}")
-
-    try:
-        neo.logout()
-    except Exception:
-        pass
-
-    raise SystemExit(1)
-
-
-# =============================================================================
-# FINAL AUTHENTICATION RESULT
-# =============================================================================
-
-print()
-print("=" * 80)
-print("AUTHENTICATION RESULT")
-print("=" * 80)
-
-print("[PASS] TOTP format validated.")
-print("[PASS] TOTP login completed.")
-print("[PASS] MPIN validation completed.")
-
-print()
-print(
-    "[NEXT STEP] Authentication boundary passed."
+passed = sum(
+    1
+    for item in report["checks"]
+    if item["status"] == "PASS"
 )
 
-print(
-    "[NEXT STEP] The next debugger can test "
-    "quotes() and SFeed WebSocket."
+partial = sum(
+    1
+    for item in report["checks"]
+    if item["status"] == "PARTIAL"
 )
 
-print()
-print(
-    "[SAFETY] No order API was called."
+missing = sum(
+    1
+    for item in report["checks"]
+    if item["status"] == "MISSING"
 )
-print(
-    "[SAFETY] No order was placed, modified, or cancelled."
+
+errors = len(
+    report["errors"]
+)
+
+total = len(
+    report["checks"]
+)
+
+report["summary"] = {
+    "total_checks": total,
+    "passed": passed,
+    "partial": partial,
+    "missing": missing,
+    "errors": errors,
+}
+
+
+# ============================================================
+# WRITE REPORT
+# ============================================================
+
+report_path = (
+    PROJECT_ROOT
+    / "kotak_pipeline_deep_validation.json"
+)
+
+report_path.write_text(
+    json.dumps(
+        report,
+        indent=2,
+        default=str,
+    ),
+    encoding="utf-8",
 )
 
 
-# =============================================================================
-# CLEAN LOGOUT
-# =============================================================================
+# ============================================================
+# FINAL OUTPUT
+# ============================================================
 
 print()
-print("=" * 80)
-print("CLEANUP")
-print("=" * 80)
+print("=" * 70)
+print("SUMMARY")
+print("=" * 70)
 
-try:
+print(
+    json.dumps(
+        report["summary"],
+        indent=2,
+    )
+)
 
-    neo.logout()
+print()
 
-    print("[PASS] logout() completed.")
-
-except Exception as exc:
+if errors == 0 and missing == 0:
 
     print(
-        f"[WARNING] logout() failed: {exc}"
+        "RESULT: DEEP VALIDATION COMPLETED"
     )
+
+elif errors == 0:
+
+    print(
+        "RESULT: VALIDATION COMPLETED WITH PARTIAL FINDINGS"
+    )
+
+else:
+
+    print(
+        "RESULT: RUNTIME VALIDATION ISSUES DETECTED"
+    )
+
+print()
+print("Report written to:")
+print(report_path)

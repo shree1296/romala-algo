@@ -1,13 +1,16 @@
-"""Romala Algo — FastAPI backend with Kotak Neo integration.
+﻿"""Romala Algo â€” FastAPI backend with Kotak Neo integration.
 
 Run with: uvicorn main:app --reload --port 8000
 """
+
+
 from __future__ import annotations
 
 import os
 import sys
 import time
 import logging
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -38,44 +41,105 @@ app.add_middleware(
 neo = KotakNeoClient()
 START_TIME = time.time()
 
-# ─── Connected WebSocket clients (for live tick broadcast) ───
+@app.on_event("startup")
+async def _capture_application_event_loop() -> None:
+    """
+    Capture the FastAPI/Uvicorn event loop.
+
+    Kotak Neo SDK callbacks may arrive from a background thread.
+    That thread must NOT attempt to create or retrieve its own
+    asyncio event loop.
+    """
+    app.state.event_loop = asyncio.get_running_loop()
+    logger.info("FastAPI event loop captured for broker callbacks.")
+
+
+# â”€â”€â”€ Connected WebSocket clients (for live tick broadcast) â”€â”€â”€
 _active_ws_clients: list[WebSocket] = []
-import asyncio
 
 
 def _broadcast_tick(tick: dict) -> None:
-    """Forward a Kotak Neo tick to every connected WS client.
-
-    Called from the Neo SDK's background thread, so we schedule the
-    async sends on the running event loop rather than awaiting directly.
     """
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
+    Forward a Kotak Neo tick to every connected frontend WebSocket client.
+
+    The Kotak Neo SDK may invoke this callback from a background thread.
+    Therefore we must always schedule WebSocket sends on the FastAPI
+    application's running event loop.
+    """
+
+    loop = getattr(app.state, "event_loop", None)
+
+    if loop is None or loop.is_closed():
+        logger.warning(
+            "Cannot broadcast tick: application event loop unavailable."
+        )
         return
-    dead: list[WebSocket] = []
-    for ws in _active_ws_clients:
+
+    clients = list(_active_ws_clients)
+
+    for ws in clients:
+
         if ws.client_state.name != "CONNECTED":
-            dead.append(ws)
+
+            try:
+                _active_ws_clients.remove(ws)
+            except ValueError:
+                pass
+
             continue
+
         try:
-            loop.call_soon_threadsafe(
-                asyncio.ensure_future,
-                ws.send_json({"type": "tick", "data": tick}),
+
+            future = asyncio.run_coroutine_threadsafe(
+                ws.send_json({
+                    "type": "tick",
+                    "data": tick,
+                }),
+                loop,
             )
-        except Exception as e:
-            logger.warning(f"broadcast tick send failed: {e}")
-            dead.append(ws)
-    for ws in dead:
-        if ws in _active_ws_clients:
-            _active_ws_clients.remove(ws)
 
+            def _handle_send_result(
+                future_result,
+                websocket=ws,
+            ):
 
+                try:
+                    future_result.result()
+
+                except Exception as exc:
+
+                    logger.warning(
+                        "WebSocket tick send failed: %s",
+                        exc,
+                    )
+
+                    def _remove_client():
+
+                        try:
+                            _active_ws_clients.remove(websocket)
+                        except ValueError:
+                            pass
+
+                    if not loop.is_closed():
+                        loop.call_soon_threadsafe(
+                            _remove_client
+                        )
+
+            future.add_done_callback(
+                _handle_send_result
+            )
+
+        except Exception as exc:
+
+            logger.warning(
+                "Failed to schedule tick broadcast: %s",
+                exc,
+            )
 # Register our broadcast as the tick callback so the Neo SDK pushes
 # every live tick through to all connected frontend WebSocket clients.
 neo.on_tick(_broadcast_tick)
 
-# ─── Real NSE instrument tokens for watchlist/quotes ───
+# â”€â”€â”€ Real NSE instrument tokens for watchlist/quotes â”€â”€â”€
 NSE_SYMBOLS = [
     {"symbol": "NIFTY", "exchange": "nse_cm", "token": "256265", "isIndex": True},
     {"symbol": "BANKNIFTY", "exchange": "nse_cm", "token": "260105", "isIndex": True},
@@ -100,7 +164,7 @@ NSE_SYMBOLS = [
 ]
 
 
-# ─── Helper: parse Kotak Neo quote response to our Quote schema ───
+# â”€â”€â”€ Helper: parse Kotak Neo quote response to our Quote schema â”€â”€â”€
 
 def _parse_quote(raw: dict, symbol: str = "") -> dict[str, Any]:
     """Normalize Kotak Neo quote response to our frontend schema."""
@@ -136,7 +200,7 @@ def _parse_quote(raw: dict, symbol: str = "") -> dict[str, Any]:
     }
 
 
-# ─── Helper: build OHLC bars from Kotak Neo historical / quotes ───
+# â”€â”€â”€ Helper: build OHLC bars from Kotak Neo historical / quotes â”€â”€â”€
 
 def _bars_from_quotes(symbol: str, count: int = 200) -> list[OHLCBar]:
     """Fetch historical candles. Kotak Neo SDK doesn't have a direct
@@ -193,9 +257,9 @@ def _bars_from_quotes(symbol: str, count: int = 200) -> list[OHLCBar]:
     return []
 
 
-# ═══════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 # ROUTES
-# ═══════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 @app.get("/api/health")
 async def health():
@@ -207,7 +271,7 @@ async def health():
     }
 
 
-# ─── Broker ───
+# â”€â”€â”€ Broker â”€â”€â”€
 
 class LoginRequest(BaseModel):
     consumer_key: str = ""
@@ -220,30 +284,89 @@ class LoginRequest(BaseModel):
 
 @app.get("/api/broker/status")
 async def broker_status():
-    return neo._status()
+
+    raw_status = neo._status()
+
+    if not isinstance(raw_status, dict):
+        raw_status = {
+            "message": str(raw_status)
+        }
+
+    connected = bool(neo.connected)
+
+    raw_status["connected"] = connected
+
+    raw_status["status"] = (
+        "connected"
+        if connected
+        else "disconnected"
+    )
+
+    raw_status.setdefault(
+        "message",
+        (
+            "Connected"
+            if connected
+            else "Not connected â€” please login"
+        ),
+    )
+
+    return raw_status
 
 
 @app.post("/api/broker/login")
 async def broker_login(req: LoginRequest):
+
     creds = {
-        "consumer_key": req.consumer_key or os.getenv("NEO_CONSUMER_KEY", ""),
-        "mobile_number": req.mobile_number,
+        "consumer_key": (
+            req.consumer_key
+            or os.getenv("KOTAK_CONSUMER_KEY", "")
+            or os.getenv("NEO_CONSUMER_KEY", "")
+        ),
+
+        "mobile_number": (
+            req.mobile_number
+            or os.getenv("KOTAK_MOBILE_NUMBER", "")
+        ),
+
+        "ucc": (
+            req.ucc
+            or os.getenv("KOTAK_UCC", "")
+        ),
+
         "password": req.password,
-        "mpin": req.mpin,
-        "totp": req.totp,
+
+        "mpin": (
+            req.mpin
+            or os.getenv("KOTAK_MPIN", "")
+        ),
+
+        "totp": (
+            req.totp
+            or os.getenv("KOTAK_TOTP", "")
+        ),
     }
+
     try:
+
         return neo.login(creds)
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=str(e))
 
+    except Exception as exc:
 
+        logger.exception(
+            "Kotak Neo login failed"
+        )
+
+        raise HTTPException(
+            status_code=401,
+            detail=str(exc),
+        )
 @app.post("/api/broker/logout")
 async def broker_logout():
     return neo.logout()
 
 
-# ─── Market Data ───
+# â”€â”€â”€ Market Data â”€â”€â”€
 
 class QuoteRequest(BaseModel):
     instrument_tokens: list[dict] = []
@@ -251,17 +374,65 @@ class QuoteRequest(BaseModel):
 
 @app.post("/api/quotes")
 async def get_quotes(req: QuoteRequest):
+
     if not neo.connected:
-        raise HTTPException(status_code=403, detail="Broker not connected. Please login first.")
-    raw = neo.quotes(req.instrument_tokens)
+        raise HTTPException(
+            status_code=403,
+            detail="Broker not connected. Please login first.",
+        )
+
+    try:
+
+        raw = neo.quotes(
+            req.instrument_tokens
+        )
+
+    except Exception as exc:
+
+        logger.exception(
+            "Quote request failed"
+        )
+
+        raise HTTPException(
+            status_code=502,
+            detail=str(exc),
+        )
+
     results = []
-    for i, tok in enumerate(req.instrument_tokens):
-        r = raw[i] if i < len(raw) else {}
-        sym = next((s["symbol"] for s in NSE_SYMBOLS if s["token"] == tok.get("instrument_token")), tok.get("instrument_token", ""))
-        results.append(_parse_quote(r, sym))
+
+    for i, tok in enumerate(
+        req.instrument_tokens
+    ):
+
+        r = (
+            raw[i]
+            if i < len(raw)
+            else {}
+        )
+
+        sym = next(
+            (
+                s["symbol"]
+                for s in NSE_SYMBOLS
+                if s["token"]
+                == tok.get(
+                    "instrument_token"
+                )
+            ),
+            tok.get(
+                "instrument_token",
+                "",
+            ),
+        )
+
+        results.append(
+            _parse_quote(
+                r,
+                sym,
+            )
+        )
+
     return results
-
-
 @app.get("/api/quote")
 async def get_quote(symbol: str, exchange: str = "nse_cm"):
     if not neo.connected:
@@ -321,21 +492,31 @@ async def get_historical(symbol: str, exchange: str = "nse_cm", interval: str = 
     if not neo.connected:
         raise HTTPException(status_code=403, detail="Broker not connected. Please login first.")
     bars = _bars_from_quotes(symbol, count)
-    return [
-        {
-            "timestamp": b.timestamp,
-            "date": b.date,
-            "open": b.open,
-            "high": b.high,
-            "low": b.low,
-            "close": b.close,
-            "volume": b.volume,
-        }
-        for b in bars
-    ]
+    return {
+        "symbol": symbol,
+        "exchange": exchange,
+        "interval": interval,
+        "data_source": "synthetic_fallback",
+        "warning": (
+            "These candles are generated from current quote OHLC data "
+            "and are NOT genuine historical market candles."
+        ),
+        "bars": [
+            {
+                "timestamp": b.timestamp,
+                "date": b.date,
+                "open": b.open,
+                "high": b.high,
+                "low": b.low,
+                "close": b.close,
+                "volume": b.volume,
+            }
+            for b in bars
+        ],
+    }
 
 
-# ─── Indicators ───
+# â”€â”€â”€ Indicators â”€â”€â”€
 
 @app.get("/api/indicators")
 async def get_indicators(symbol: str, exchange: str = "nse_cm", timeframe: str = "1m", bars: int = 100):
@@ -354,6 +535,11 @@ async def get_indicators(symbol: str, exchange: str = "nse_cm", timeframe: str =
         "symbol": symbol,
         "timeframe": timeframe,
         "bars": len(ohlc_bars),
+        "data_source": "synthetic_fallback",
+        "warning": (
+            "Indicators are currently calculated from generated "
+            "fallback candles, not genuine historical candles."
+        ),
         "indicators": indicator_list,
         "computed_at": int(time.time() * 1000),
     }
@@ -402,7 +588,7 @@ def _desc_for(name: str) -> str:
     return descs.get(name, name.replace("_", " ").title())
 
 
-# ─── Strategies ───
+# â”€â”€â”€ Strategies â”€â”€â”€
 
 @app.get("/api/strategies")
 async def get_strategies():
@@ -416,10 +602,25 @@ async def run_strategy_endpoint(strategy_id: str, symbol: str, exchange: str = "
     bars = _bars_from_quotes(symbol, 200)
     if not bars:
         raise HTTPException(status_code=404, detail=f"No data for symbol {symbol}")
-    return run_strategy(strategy_id, symbol, bars)
+    result = run_strategy(
+        strategy_id,
+        symbol,
+        bars,
+    )
+
+    if isinstance(result, dict):
+
+        result["data_source"] = "synthetic_fallback"
+
+        result["warning"] = (
+            "This strategy result is currently calculated from "
+            "generated fallback candles, not genuine historical candles."
+        )
+
+    return result
 
 
-# ─── Scanner ───
+# â”€â”€â”€ Scanner â”€â”€â”€
 
 class ScanRequest(BaseModel):
     symbols: list[str] = []
@@ -459,11 +660,22 @@ async def scan_market(req: ScanRequest):
                 "indicators": {},
                 "timestamp": int(time.time() * 1000),
             })
-    results.sort(key=lambda r: r["confidence"], reverse=True)
-    return results
+    results.sort(
+        key=lambda r: r["confidence"],
+        reverse=True,
+    )
+
+    return {
+        "data_source": "synthetic_fallback",
+        "warning": (
+            "Scanner signals are currently calculated from generated "
+            "fallback candles, not genuine historical market candles."
+        ),
+        "results": results,
+    }
 
 
-# ─── Orders ───
+# â”€â”€â”€ Orders â”€â”€â”€
 
 class OrderReq(BaseModel):
     exchange_segment: str = "nse_cm"
@@ -556,7 +768,7 @@ async def get_trades():
     return neo.trade_report()
 
 
-# ─── Portfolio ───
+# â”€â”€â”€ Portfolio â”€â”€â”€
 
 @app.get("/api/positions")
 async def get_positions():
@@ -579,7 +791,7 @@ async def get_limits(segment: str = "ALL", exchange: str = "ALL", product: str =
     return neo.limits(segment=segment, exchange=exchange, product=product)
 
 
-# ─── WebSocket for live ticks ───
+# â”€â”€â”€ WebSocket for live ticks â”€â”€â”€
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -614,3 +826,5 @@ async def websocket_endpoint(websocket: WebSocket):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+

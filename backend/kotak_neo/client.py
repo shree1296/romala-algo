@@ -1,88 +1,354 @@
-"""Kotak Neo API client wrapper.
+﻿"""
+Kotak Neo API client wrapper.
 
-Wraps the neo_api_client SDK with session management, error handling,
-and normalized return values. Uses the real Kotak Neo API exclusively.
+Responsibilities:
+
+- Authentication
+- TOTP / MPIN validation
+- SDK session lifecycle
+- Account connection state
+- Market data
+- Orders
+- Portfolio
+- WebSocket subscriptions
+
+This wrapper uses the official installed neo_api_client SDK.
 """
+
 from __future__ import annotations
 
-import os
+import base64
+import binascii
 import json
-import time
 import logging
-from typing import Any, Callable
+import os
+import time
+from typing import Any, Callable, Optional
+
 
 logger = logging.getLogger("romala.kotak")
 
-try:
-    from neo_api_client import NeoAPI
-except Exception as _import_err:
-    NeoAPI = None
-    logger.warning(f"neo_api_client not installed: {_import_err}")
 
+# ============================================================
+# KOTAK NEO SDK IMPORT
+# ============================================================
+
+NeoAPI: Any | None = None
+NEO_IMPORT_ERROR: Exception | None = None
+
+
+try:
+    from neo_api_client import NeoAPI as _NeoAPI
+
+    NeoAPI = _NeoAPI
+
+except Exception as exc:
+
+    NEO_IMPORT_ERROR = exc
+
+    logger.exception(
+        "neo_api_client could not be imported."
+    )
+
+
+# ============================================================
+# CLIENT
+# ============================================================
 
 class KotakNeoClient:
-    """Singleton wrapper around NeoAPI."""
+    """
+    Singleton wrapper around Kotak Neo SDK.
+    """
 
-    _instance: KotakNeoClient | None = None
+    _instance: Optional["KotakNeoClient"] = None
 
-    def __new__(cls) -> KotakNeoClient:
+
+    def __new__(cls) -> "KotakNeoClient":
+
         if cls._instance is None:
+
             cls._instance = super().__new__(cls)
+
             cls._instance._initialized = False
+
         return cls._instance
 
+
     def __init__(self) -> None:
+
         if self._initialized:
             return
+
         self._initialized = True
+
         self.client: Any = None
-        self.connected = False
-        self.user_info: dict[str, str] = {}
+
+        self.connected: bool = False
+
+        self.user_info: dict[str, Any] = {}
+
         self.credentials: dict[str, str] = {}
-        self.consumer_key = os.getenv("NEO_CONSUMER_KEY", "")
-        self._tick_callbacks: list[Callable[[dict], None]] = []
 
-    def login(self, credentials):
+        self.consumer_key = (
+            os.getenv("KOTAK_CONSUMER_KEY", "")
+            or os.getenv("NEO_CONSUMER_KEY", "")
+        ).strip()
+
+        self.last_connected: Optional[int] = None
+
+        self._tick_callbacks: list[
+            Callable[[dict], None]
+        ] = []
+
+
+    # ========================================================
+    # INTERNAL HELPERS
+    # ========================================================
+
+    def _require_connection(self) -> None:
+
+        if not self.connected or self.client is None:
+
+            raise RuntimeError(
+                "Kotak Neo client is not connected. "
+                "Please login first."
+            )
+
+
+    @staticmethod
+    def _value(
+        source: Any,
+        *names: str,
+    ) -> Optional[str]:
+
+        for name in names:
+
+            if isinstance(source, dict):
+
+                value = source.get(name)
+
+            else:
+
+                value = getattr(
+                    source,
+                    name,
+                    None,
+                )
+
+            if value is not None:
+
+                value = str(value).strip()
+
+                if value:
+
+                    return value
+
+        return None
+
+
+    @staticmethod
+    def _extract_user_info(
+        *responses: Any,
+        fallback_ucc: Optional[str] = None,
+    ) -> dict[str, Any]:
+
+        result: dict[str, Any] = {}
+
+        def walk(data: Any) -> None:
+
+            if isinstance(data, dict):
+
+                mappings = {
+                    "user_id": [
+                        "user_id",
+                        "userid",
+                        "userId",
+                        "ucc",
+                        "account_id",
+                        "accountId",
+                    ],
+
+                    "user_name": [
+                        "user_name",
+                        "username",
+                        "userName",
+                        "name",
+                        "client_name",
+                    ],
+
+                    "email": [
+                        "email",
+                        "email_id",
+                        "emailId",
+                    ],
+
+                    "account_id": [
+                        "account_id",
+                        "accountId",
+                        "ucc",
+                    ],
+                }
+
+                for target, keys in mappings.items():
+
+                    if target in result:
+                        continue
+
+                    for key in keys:
+
+                        value = data.get(key)
+
+                        if value not in (
+                            None,
+                            "",
+                        ):
+
+                            result[target] = value
+
+                            break
+
+                for value in data.values():
+
+                    if isinstance(
+                        value,
+                        (dict, list),
+                    ):
+
+                        walk(value)
+
+            elif isinstance(data, list):
+
+                for item in data:
+
+                    walk(item)
+
+
+        for response in responses:
+
+            walk(response)
+
+        if fallback_ucc:
+
+            result.setdefault(
+                "user_id",
+                fallback_ucc,
+            )
+
+            result.setdefault(
+                "account_id",
+                fallback_ucc,
+            )
+
+        return result
+
+
+    @staticmethod
+    def _prepare_totp(
+        value: str,
+    ) -> str:
         """
-        Authenticate Kotak Neo using the installed SDK contract.
+        Accept either:
 
-        Flow:
-            NeoAPI(...)
-                ->
-            totp_login(...)
-                ->
-            totp_validate(mpin=...)
-
-        No order operation is performed here.
+        1. Current six-digit OTP
+        2. Base32 TOTP secret
         """
 
-        def _value(source, *names):
-            for name in names:
-                if isinstance(source, dict):
-                    value = source.get(name)
-                else:
-                    value = getattr(source, name, None)
+        value = value.strip()
 
-                if value is not None and str(value).strip():
-                    return str(value).strip()
+        # ----------------------------------------------------
+        # CURRENT 6 DIGIT OTP
+        # ----------------------------------------------------
 
-            return None
+        if value.isdigit() and len(value) == 6:
 
-        consumer_key = _value(
+            return value
+
+
+        # ----------------------------------------------------
+        # BASE32 SECRET
+        # ----------------------------------------------------
+
+        normalized = (
+            value
+            .replace(" ", "")
+            .replace("-", "")
+            .upper()
+        )
+
+        try:
+
+            # Validate Base32 before passing to pyotp.
+            padding = "=" * (
+                (-len(normalized)) % 8
+            )
+
+            base64.b32decode(
+                normalized + padding,
+                casefold=True,
+            )
+
+        except (
+            binascii.Error,
+            ValueError,
+        ) as exc:
+
+            raise RuntimeError(
+                "KOTAK_TOTP must be either a current "
+                "six-digit OTP or a valid Base32 TOTP secret."
+            ) from exc
+
+
+        try:
+
+            import pyotp
+
+        except ImportError as exc:
+
+            raise RuntimeError(
+                "pyotp is required when KOTAK_TOTP "
+                "contains a Base32 secret."
+            ) from exc
+
+
+        try:
+
+            return pyotp.TOTP(
+                normalized
+            ).now()
+
+        except Exception as exc:
+
+            raise RuntimeError(
+                "Unable to generate OTP from "
+                "KOTAK_TOTP Base32 secret."
+            ) from exc
+
+
+    # ========================================================
+    # LOGIN
+    # ========================================================
+
+    def login(
+        self,
+        credentials: Any,
+    ) -> dict[str, Any]:
+
+        consumer_key = self._value(
             credentials,
             "consumer_key",
             "api_key",
             "KOTAK_CONSUMER_KEY",
+            "NEO_CONSUMER_KEY",
         )
 
-        mobile_number = _value(
+        mobile_number = self._value(
             credentials,
             "mobile_number",
             "mobile",
             "KOTAK_MOBILE_NUMBER",
         )
 
-        ucc = _value(
+        ucc = self._value(
             credentials,
             "ucc",
             "user_id",
@@ -90,17 +356,22 @@ class KotakNeoClient:
             "KOTAK_UCC",
         )
 
-        mpin = _value(
+        mpin = self._value(
             credentials,
             "mpin",
             "KOTAK_MPIN",
         )
 
-        totp = _value(
+        totp = self._value(
             credentials,
             "totp",
             "KOTAK_TOTP",
         )
+
+
+        # ----------------------------------------------------
+        # VALIDATE
+        # ----------------------------------------------------
 
         missing = []
 
@@ -119,308 +390,795 @@ class KotakNeoClient:
         if not totp:
             missing.append("totp")
 
+
         if missing:
+
             raise ValueError(
                 "Missing Kotak authentication fields: "
                 + ", ".join(missing)
             )
 
-        # The installed SDK contract does not expose session_init().
-        from neo_api_client import NeoAPI
 
-        self.client = NeoAPI(
-            consumer_key=consumer_key,
-            environment="prod",
-        )
+        if NeoAPI is None:
 
-        login_response = self.client.totp_login(
-            mobile_number=mobile_number,
-            ucc=ucc,
-            totp=totp,
-        )
-
-        if not isinstance(login_response, dict):
             raise RuntimeError(
-                "Unexpected response type from totp_login(): "
-                + type(login_response).__name__
+                "Kotak Neo SDK is unavailable. "
+                f"Import error: {NEO_IMPORT_ERROR}"
             )
+
+
+        # ----------------------------------------------------
+        # RESET OLD SESSION
+        # ----------------------------------------------------
+
+        self.connected = False
+
+        self.client = None
+
+        self.user_info = {}
+
+        self.last_connected = None
+
+
+        # ----------------------------------------------------
+        # CREATE SDK CLIENT
+        # ----------------------------------------------------
+
+        try:
+
+            client = NeoAPI(
+                consumer_key=consumer_key,
+                environment="prod",
+            )
+
+        except Exception as exc:
+
+            raise RuntimeError(
+                "Failed to initialize Kotak Neo SDK: "
+                f"{exc}"
+            ) from exc
+
+
+        # ----------------------------------------------------
+        # TOTP LOGIN
+        # ----------------------------------------------------
+
+        try:
+
+            login_response = client.totp_login(
+                mobile_number=mobile_number,
+                ucc=ucc,
+                totp=totp,
+            )
+
+        except Exception as exc:
+
+            raise RuntimeError(
+                "Kotak TOTP login request failed: "
+                f"{exc}"
+            ) from exc
+
+
+        if not isinstance(
+            login_response,
+            dict,
+        ):
+
+            raise RuntimeError(
+                "Unexpected response type from "
+                "Kotak totp_login(): "
+                f"{type(login_response).__name__}"
+            )
+
 
         if login_response.get("error"):
+
             raise RuntimeError(
                 "Kotak TOTP login failed: "
-                + str(login_response.get("error"))
+                + str(
+                    login_response.get("error")
+                )
             )
 
-        validation_response = self.client.totp_validate(
-            mpin=mpin
-        )
 
-        if not isinstance(validation_response, dict):
+        # ----------------------------------------------------
+        # MPIN VALIDATION
+        # ----------------------------------------------------
+
+        try:
+
+            validation_response = (
+                client.totp_validate(
+                    mpin=mpin
+                )
+            )
+
+        except Exception as exc:
+
             raise RuntimeError(
-                "Unexpected response type from totp_validate(): "
-                + type(validation_response).__name__
+                "Kotak MPIN validation request failed: "
+                f"{exc}"
+            ) from exc
+
+
+        if not isinstance(
+            validation_response,
+            dict,
+        ):
+
+            raise RuntimeError(
+                "Unexpected response type from "
+                "Kotak totp_validate(): "
+                f"{type(validation_response).__name__}"
             )
+
 
         if validation_response.get("error"):
+
             raise RuntimeError(
                 "Kotak MPIN validation failed: "
-                + str(validation_response.get("error"))
+                + str(
+                    validation_response.get("error")
+                )
             )
 
-        # Set common facade state only when these attributes already
-        # exist or can safely be attached to this wrapper object.
+
+        # ----------------------------------------------------
+        # SESSION SUCCESS
+        # ----------------------------------------------------
+
+        self.client = client
+
         self.connected = True
 
+        self.last_connected = (
+            int(time.time() * 1000)
+        )
+
+        self.credentials = {
+            "consumer_key": consumer_key,
+            "mobile_number": mobile_number,
+            "ucc": ucc,
+        }
+
+        self.user_info = (
+            self._extract_user_info(
+                login_response,
+                validation_response,
+                fallback_ucc=ucc,
+            )
+        )
+
+
+        logger.info(
+            "Kotak Neo login successful for UCC ending in %s",
+            ucc[-4:] if len(ucc) >= 4 else "****",
+        )
+
+
         return {
+
             "status": "success",
+
             "authenticated": True,
+
+            "connected": True,
+
             "broker": "Kotak Neo",
+
+            "user_info": self.user_info,
+
             "login_response": login_response,
+
             "validation_response": validation_response,
         }
 
-    def auto_login(self) -> dict[str, Any]:
-        """Authenticate using the current Kotak environment contract.
 
-        Required environment variables:
+    # ========================================================
+    # AUTO LOGIN
+    # ========================================================
 
-            KOTAK_CONSUMER_KEY
-            KOTAK_MOBILE_NUMBER
-            KOTAK_UCC
-            KOTAK_MPIN
-            KOTAK_TOTP
+    def auto_login(
+        self,
+    ) -> dict[str, Any]:
 
-        KOTAK_TOTP may be either:
+        consumer_key = (
+            os.getenv(
+                "KOTAK_CONSUMER_KEY",
+                "",
+            )
+            or os.getenv(
+                "NEO_CONSUMER_KEY",
+                "",
+            )
+        ).strip()
 
-        1. A current six-digit authenticator code, or
-        2. A valid Base32 TOTP secret.
+        mobile = os.getenv(
+            "KOTAK_MOBILE_NUMBER",
+            "",
+        ).strip()
 
-        If a Base32 secret is supplied, pyotp generates the current
-        six-digit code locally.
+        ucc = os.getenv(
+            "KOTAK_UCC",
+            "",
+        ).strip()
 
-        No order operation is performed here.
-        """
+        mpin = os.getenv(
+            "KOTAK_MPIN",
+            "",
+        ).strip()
 
-        consumer_key = os.getenv("KOTAK_CONSUMER_KEY", "").strip()
-        mobile = os.getenv("KOTAK_MOBILE_NUMBER", "").strip()
-        ucc = os.getenv("KOTAK_UCC", "").strip()
-        mpin = os.getenv("KOTAK_MPIN", "").strip()
-        totp_value = os.getenv("KOTAK_TOTP", "").strip()
+        totp_value = os.getenv(
+            "KOTAK_TOTP",
+            "",
+        ).strip()
+
 
         values = {
-            "KOTAK_CONSUMER_KEY": consumer_key,
-            "KOTAK_MOBILE_NUMBER": mobile,
-            "KOTAK_UCC": ucc,
-            "KOTAK_MPIN": mpin,
-            "KOTAK_TOTP": totp_value,
+
+            "KOTAK_CONSUMER_KEY":
+                consumer_key,
+
+            "KOTAK_MOBILE_NUMBER":
+                mobile,
+
+            "KOTAK_UCC":
+                ucc,
+
+            "KOTAK_MPIN":
+                mpin,
+
+            "KOTAK_TOTP":
+                totp_value,
         }
 
+
         missing = [
+
             name
-            for name, value in values.items()
+
+            for name, value
+
+            in values.items()
+
             if not value
         ]
 
+
         if missing:
+
             raise RuntimeError(
                 "Auto-login missing environment variables: "
                 + ", ".join(missing)
             )
 
-        if totp_value.isdigit() and len(totp_value) == 6:
-            totp_code = totp_value
 
-        else:
-            try:
-                import pyotp
-            except ImportError as exc:
-                raise RuntimeError(
-                    "KOTAK_TOTP is not a six-digit OTP and pyotp is "
-                    "required to generate a TOTP from a valid Base32 secret. "
-                    "Install with: pip install pyotp"
-                ) from exc
+        # Generate / validate TOTP
 
-            try:
-                totp_code = pyotp.TOTP(
-                    totp_value.replace(" ", "").upper()
-                ).now()
-            except Exception as exc:
-                raise RuntimeError(
-                    "KOTAK_TOTP is neither a valid six-digit OTP nor "
-                    "a valid Base32 TOTP secret."
-                ) from exc
-
-        logger.info(
-            "Kotak auto-login prepared using KOTAK_* credentials."
+        totp_code = self._prepare_totp(
+            totp_value
         )
 
+
+        logger.info(
+            "Kotak Neo auto-login starting."
+        )
+
+
         return self.login({
-            "consumer_key": consumer_key,
-            "mobile_number": mobile,
-            "ucc": ucc,
-            "mpin": mpin,
-            "totp": totp_code,
+
+            "consumer_key":
+                consumer_key,
+
+            "mobile_number":
+                mobile,
+
+            "ucc":
+                ucc,
+
+            "mpin":
+                mpin,
+
+            "totp":
+                totp_code,
         })
 
 
-    def logout(self) -> dict[str, str]:
-        if self.client and self.connected:
-            try:
-                self.client.logout()
-            except Exception as e:
-                logger.warning(f"Logout error: {e}")
-        self.connected = False
-        self.client = None
-        self.user_info = {}
-        return {"status": "disconnected"}
+    # ========================================================
+    # LOGOUT
+    # ========================================================
 
-    def _status(self) -> dict[str, Any]:
+    def logout(
+        self,
+    ) -> dict[str, str]:
+
+        if self.client is not None:
+
+            try:
+
+                logout_method = getattr(
+                    self.client,
+                    "logout",
+                    None,
+                )
+
+                if callable(
+                    logout_method
+                ):
+
+                    logout_method()
+
+            except Exception as exc:
+
+                logger.warning(
+                    "Kotak logout error: %s",
+                    exc,
+                )
+
+
+        self.connected = False
+
+        self.client = None
+
+        self.user_info = {}
+
+        self.credentials = {}
+
+        self.last_connected = None
+
+
         return {
-            "status": "connected" if self.connected else "disconnected",
-            "broker": "Kotak Neo",
-            "user_id": self.user_info.get("user_id"),
-            "user_name": self.user_info.get("user_name"),
-            "email": self.user_info.get("email"),
-            "account_id": self.user_info.get("account_id"),
-            "message": "Connected and authenticated" if self.connected else "Not connected — please login",
-            "last_connected": int(time.time() * 1000) if self.connected else None,
+
+            "status":
+                "disconnected"
         }
 
-    # ─── Market Data ───
 
-    def quotes(self, instrument_tokens: list[dict], quote_type: str = "all") -> list[dict]:
-        """Get quotes for given instruments from Kotak Neo."""
-        try:
-            return self.client.quotes(instrument_tokens=instrument_tokens, quote_type=quote_type)
-        except Exception as e:
-            logger.error(f"Quotes error: {e}")
-            return []
+    # ========================================================
+    # STATUS
+    # ========================================================
 
-    def scrip_master(self, exchange_segment: str = "") -> list[dict]:
-        """Get scrip master list from Kotak Neo."""
-        try:
-            return self.client.scrip_master(exchange_segment=exchange_segment)
-        except Exception as e:
-            logger.error(f"Scrip master error: {e}")
-            return []
+    def _status(
+        self,
+    ) -> dict[str, Any]:
 
-    def search_scrip(self, segment: str, symbol: str, expiry: str = "", option_type: str = "", strike_price: str = "") -> list[dict]:
+        return {
+
+            "status":
+                (
+                    "connected"
+                    if self.connected
+                    else "disconnected"
+                ),
+
+            "broker":
+                "Kotak Neo",
+
+            "user_id":
+                self.user_info.get(
+                    "user_id"
+                ),
+
+            "user_name":
+                self.user_info.get(
+                    "user_name"
+                ),
+
+            "email":
+                self.user_info.get(
+                    "email"
+                ),
+
+            "account_id":
+                self.user_info.get(
+                    "account_id"
+                ),
+
+            "message":
+
+                (
+                    "Connected and authenticated"
+                    if self.connected
+                    else "Not connected - please login"
+                ),
+
+            "last_connected":
+                self.last_connected,
+
+            "connected":
+                self.connected,
+        }
+
+
+    # ========================================================
+    # MARKET DATA
+    # ========================================================
+
+    def quotes(
+        self,
+        instrument_tokens: list[dict],
+        quote_type: str = "all",
+    ) -> list[dict]:
+
+        self._require_connection()
+
+
         try:
-            return self.client.search_scrip(
-                exchange_segment=segment, symbol=symbol,
-                expiry=expiry, option_type=option_type, strike_price=strike_price,
+
+            response = self.client.quotes(
+                instrument_tokens=instrument_tokens,
+                quote_type=quote_type,
             )
-        except Exception as e:
-            logger.error(f"Search scrip error: {e}")
+
+
+        except Exception as exc:
+
+            logger.exception(
+                "Kotak Neo quotes request failed."
+            )
+
+            raise RuntimeError(
+                "Unable to fetch Kotak Neo quotes: "
+                f"{exc}"
+            ) from exc
+
+
+        if response is None:
+
             return []
 
-    # ─── Orders ───
 
-    def place_order(self, **kwargs) -> dict:
-        """Place an order through Kotak Neo."""
-        return self.client.place_order(**kwargs)
+        if isinstance(
+            response,
+            list,
+        ):
 
-    def modify_order(self, order_id: str, **kwargs) -> dict:
-        return self.client.modify_order(order_id=order_id, **kwargs)
+            return response
 
-    def cancel_order(self, order_id: str, **kwargs) -> dict:
-        return self.client.cancel_order(order_id=order_id, **kwargs)
 
-    def order_report(self) -> list[dict]:
-        """Get order book from Kotak Neo."""
-        try:
-            return self.client.order_report()
-        except Exception as e:
-            logger.error(f"Order report error: {e}")
-            return []
+        if isinstance(
+            response,
+            dict,
+        ):
 
-    def order_history(self, order_id: str) -> dict:
-        try:
-            return self.client.order_history(order_id=order_id)
-        except Exception as e:
-            logger.error(f"Order history error: {e}")
-            return {}
+            data = response.get(
+                "data"
+            )
 
-    def trade_report(self, order_id: str = "") -> list[dict]:
-        try:
-            return self.client.trade_report(order_id=order_id) if order_id else self.client.trade_report()
-        except Exception as e:
-            logger.error(f"Trade report error: {e}")
-            return []
+            if isinstance(
+                data,
+                list,
+            ):
 
-    # ─── Portfolio ───
+                return data
 
-    def positions(self) -> list[dict]:
-        try:
-            return self.client.positions()
-        except Exception as e:
-            logger.error(f"Positions error: {e}")
-            return []
+            return [
+                response
+            ]
 
-    def holdings(self) -> list[dict]:
-        try:
-            return self.client.holdings()
-        except Exception as e:
-            logger.error(f"Holdings error: {e}")
-            return []
 
-    def limits(self, segment: str = "ALL", exchange: str = "ALL", product: str = "ALL") -> dict:
-        try:
-            return self.client.limits(segment=segment, exchange=exchange, product=product)
-        except Exception as e:
-            logger.error(f"Limits error: {e}")
-            return {"available_margin": 0, "utilised_margin": 0, "total_margin": 0, "realised": 0, "unrealised": 0, "total": 0}
+        raise RuntimeError(
+            "Unexpected Kotak quotes response type: "
+            f"{type(response).__name__}"
+        )
 
-    def margin_required(self, **kwargs) -> dict:
-        try:
-            return self.client.margin_required(**kwargs)
-        except Exception as e:
-            logger.error(f"Margin required error: {e}")
-            return {"margin_required": 0}
 
-    # ─── WebSocket ───
+    def scrip_master(
+        self,
+        exchange_segment: str = "",
+    ) -> Any:
 
-    def on_tick(self, callback: Callable[[dict], None]) -> None:
-        self._tick_callbacks.append(callback)
+        self._require_connection()
 
-    def off_tick(self, callback: Callable[[dict], None]) -> None:
-        if callback in self._tick_callbacks:
-            self._tick_callbacks.remove(callback)
+        return self.client.scrip_master(
+            exchange_segment=exchange_segment
+        )
 
-    def _on_message(self, message: Any) -> None:
+
+    def search_scrip(
+        self,
+        segment: str,
+        symbol: str,
+        expiry: str = "",
+        option_type: str = "",
+        strike_price: str = "",
+    ) -> Any:
+
+        self._require_connection()
+
+        return self.client.search_scrip(
+
+            exchange_segment=segment,
+
+            symbol=symbol,
+
+            expiry=expiry,
+
+            option_type=option_type,
+
+            strike_price=strike_price,
+        )
+
+
+    # ========================================================
+    # ORDERS
+    # ========================================================
+
+    def place_order(
+        self,
+        **kwargs,
+    ) -> Any:
+
+        self._require_connection()
+
+        return self.client.place_order(
+            **kwargs
+        )
+
+
+    def modify_order(
+        self,
+        order_id: str,
+        **kwargs,
+    ) -> Any:
+
+        self._require_connection()
+
+        return self.client.modify_order(
+
+            order_id=order_id,
+
+            **kwargs,
+        )
+
+
+    def cancel_order(
+        self,
+        order_id: str,
+        **kwargs,
+    ) -> Any:
+
+        self._require_connection()
+
+        return self.client.cancel_order(
+
+            order_id=order_id,
+
+            **kwargs,
+        )
+
+
+    def order_report(
+        self,
+    ) -> Any:
+
+        self._require_connection()
+
+        return self.client.order_report()
+
+
+    def order_history(
+        self,
+        order_id: str,
+    ) -> Any:
+
+        self._require_connection()
+
+        return self.client.order_history(
+            order_id=order_id
+        )
+
+
+    def trade_report(
+        self,
+        order_id: str = "",
+    ) -> Any:
+
+        self._require_connection()
+
+        if order_id:
+
+            return self.client.trade_report(
+                order_id=order_id
+            )
+
+        return self.client.trade_report()
+
+
+    # ========================================================
+    # PORTFOLIO
+    # ========================================================
+
+    def positions(
+        self,
+    ) -> Any:
+
+        self._require_connection()
+
+        return self.client.positions()
+
+
+    def holdings(
+        self,
+    ) -> Any:
+
+        self._require_connection()
+
+        return self.client.holdings()
+
+
+    def limits(
+        self,
+        segment: str = "ALL",
+        exchange: str = "ALL",
+        product: str = "ALL",
+    ) -> Any:
+
+        self._require_connection()
+
+        return self.client.limits(
+
+            segment=segment,
+
+            exchange=exchange,
+
+            product=product,
+        )
+
+
+    def margin_required(
+        self,
+        **kwargs,
+    ) -> Any:
+
+        self._require_connection()
+
+        return self.client.margin_required(
+            **kwargs
+        )
+
+
+    # ========================================================
+    # WEBSOCKET CALLBACKS
+    # ========================================================
+
+    def on_tick(
+        self,
+        callback: Callable[[dict], None],
+    ) -> None:
+
+        if callback not in (
+            self._tick_callbacks
+        ):
+
+            self._tick_callbacks.append(
+                callback
+            )
+
+
+    def off_tick(
+        self,
+        callback: Callable[[dict], None],
+    ) -> None:
+
+        if callback in (
+            self._tick_callbacks
+        ):
+
+            self._tick_callbacks.remove(
+                callback
+            )
+
+
+    def _on_message(
+        self,
+        message: Any,
+    ) -> None:
+
         if not message:
+
             return
+
+
         try:
-            data = json.loads(message) if isinstance(message, str) else message
+
+            data = (
+
+                json.loads(message)
+
+                if isinstance(
+                    message,
+                    str,
+                )
+
+                else message
+            )
+
         except Exception:
+
             data = message
-        logger.debug(f"Neo tick: {data}")
-        for cb in self._tick_callbacks:
+
+
+        logger.debug(
+            "Kotak Neo tick: %s",
+            data,
+        )
+
+
+        for callback in list(
+            self._tick_callbacks
+        ):
+
             try:
-                cb(data)
-            except Exception as e:
-                logger.warning(f"tick callback error: {e}")
 
-    def _on_error(self, error: Any) -> None:
-        logger.error(f"Neo WS error: {error}")
+                callback(
+                    data
+                )
 
-    def subscribe(self, instrument_tokens: list[dict], isIndex: bool = False, isDepth: bool = False) -> dict:
-        try:
-            return self.client.subscribe(instrument_tokens=instrument_tokens, isIndex=isIndex, isDepth=isDepth)
-        except Exception as e:
-            logger.error(f"Subscribe error: {e}")
-        return {"status": "ok"}
+            except Exception:
 
-    def unsubscribe(self, instrument_tokens: list[dict], isIndex: bool = False, isDepth: bool = False) -> dict:
-        try:
-            return self.client.un_subscribe(instrument_tokens=instrument_tokens, isIndex=isIndex, isDepth=isDepth)
-        except Exception:
-            pass
-        return {"status": "ok"}
+                logger.exception(
+                    "Kotak tick callback failed."
+                )
 
-    def subscribe_orderfeed(self) -> dict:
-        try:
-            return self.client.subscribe_to_orderfeed()
-        except Exception:
-            pass
-        return {"status": "ok"}
+
+    def _on_error(
+        self,
+        error: Any,
+    ) -> None:
+
+        logger.error(
+            "Kotak WebSocket error: %s",
+            error,
+        )
+
+
+    # ========================================================
+    # SUBSCRIPTIONS
+    # ========================================================
+
+    def subscribe(
+        self,
+        instrument_tokens: list[dict],
+        isIndex: bool = False,
+        isDepth: bool = False,
+    ) -> Any:
+
+        self._require_connection()
+
+        return self.client.subscribe(
+
+            instrument_tokens=instrument_tokens,
+
+            isIndex=isIndex,
+
+            isDepth=isDepth,
+        )
+
+
+    def unsubscribe(
+        self,
+        instrument_tokens: list[dict],
+        isIndex: bool = False,
+        isDepth: bool = False,
+    ) -> Any:
+
+        self._require_connection()
+
+        return self.client.un_subscribe(
+
+            instrument_tokens=instrument_tokens,
+
+            isIndex=isIndex,
+
+            isDepth=isDepth,
+        )
+
+
+    def subscribe_orderfeed(
+        self,
+    ) -> Any:
+
+        self._require_connection()
+
+        return self.client.subscribe_to_orderfeed()
