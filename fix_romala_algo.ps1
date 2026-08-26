@@ -1,408 +1,678 @@
 # ============================================================================
-# ROMALA ALGO - KOTAK NEO LOGIN DEBUG + AUTO FIX
+# ROMALA ALGO - LIVE DATA + KOTAK ROOT CAUSE FORENSIC AUDIT
+# READ ONLY - NO SOURCE CODE MODIFICATIONS
 # ============================================================================
 
 $ErrorActionPreference = "Continue"
 
 Write-Host ""
-Write-Host "=============================================================================="
-Write-Host "ROMALA ALGO - KOTAK NEO LOGIN DEBUG + AUTO FIX"
-Write-Host "=============================================================================="
+Write-Host "==============================================================================" -ForegroundColor Cyan
+Write-Host "ROMALA ALGO - ROOT CAUSE FORENSIC AUDIT" -ForegroundColor Cyan
+Write-Host "READ ONLY - NO CODE WILL BE MODIFIED" -ForegroundColor Yellow
+Write-Host "==============================================================================" -ForegroundColor Cyan
 Write-Host ""
 
 # ============================================================================
-# 1. PROJECT DETECTION
+# 0. PROJECT DETECTION
 # ============================================================================
 
 Write-Host "=============================================================================="
-Write-Host "1. PROJECT DETECTION"
+Write-Host "0. PROJECT DETECTION"
 Write-Host "=============================================================================="
 
 $ProjectRoot = Get-Location
-$BackendPath = Join-Path $ProjectRoot "backend"
-$MainFile = Join-Path $BackendPath "main.py"
-$ClientFile = Join-Path $BackendPath "kotak_neo\client.py"
-$EnvFile = Join-Path $BackendPath ".env"
-$VenvPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
 
-Write-Host "[INFO] Project root: $ProjectRoot"
+Write-Host "[INFO] Project Root: $ProjectRoot"
 
-foreach ($Path in @($BackendPath, $MainFile, $ClientFile)) {
+$Python = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
+
+if (-not (Test-Path $Python)) {
+    Write-Host "[FAIL] Virtual environment Python not found:" -ForegroundColor Red
+    Write-Host "       $Python"
+    exit 1
+}
+
+Write-Host "[OK] Python: $Python" -ForegroundColor Green
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+function Write-Section {
+    param([string]$Title)
+
+    Write-Host ""
+    Write-Host "==============================================================================" -ForegroundColor Cyan
+    Write-Host $Title -ForegroundColor Cyan
+    Write-Host "==============================================================================" -ForegroundColor Cyan
+}
+
+function Write-Ok {
+    param([string]$Message)
+    Write-Host "[OK] $Message" -ForegroundColor Green
+}
+
+function Write-Warn {
+    param([string]$Message)
+    Write-Host "[WARN] $Message" -ForegroundColor Yellow
+}
+
+function Write-Fail {
+    param([string]$Message)
+    Write-Host "[FAIL] $Message" -ForegroundColor Red
+}
+
+function Write-Info {
+    param([string]$Message)
+    Write-Host "[INFO] $Message" -ForegroundColor Gray
+}
+
+function Mask-Value {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return "<EMPTY>"
+    }
+
+    if ($Value.Length -le 4) {
+        return "*" * $Value.Length
+    }
+
+    return $Value.Substring(0, 2) +
+        ("*" * ($Value.Length - 4)) +
+        $Value.Substring($Value.Length - 2)
+}
+
+# ============================================================================
+# 1. FILE STRUCTURE
+# ============================================================================
+
+Write-Section "1. KOTAK ARCHITECTURE DETECTION"
+
+$ExpectedFiles = @(
+    "backend\main.py",
+    "backend\kotak_neo\client.py",
+    "backend\broker\kotak\kotak_neo_client.py",
+    "backend\market\live_quotes.py",
+    "backend\market\live_data_pipeline.py",
+    "backend\market\websocket_manager.py"
+)
+
+foreach ($File in $ExpectedFiles) {
+
+    $Path = Join-Path $ProjectRoot $File
+
     if (Test-Path $Path) {
-        Write-Host "[OK] $Path"
+        Write-Ok "$File exists"
     }
     else {
-        Write-Host "[FAIL] Missing: $Path"
-        exit 1
+        Write-Warn "$File NOT FOUND"
     }
 }
 
 # ============================================================================
-# 2. PYTHON ENVIRONMENT
+# 2. FIND ALL KOTAK CLIENT IMPORTS
 # ============================================================================
 
-Write-Host ""
-Write-Host "=============================================================================="
-Write-Host "2. PYTHON ENVIRONMENT"
-Write-Host "=============================================================================="
+Write-Section "2. FINDING ALL KOTAK CLIENT IMPORTS"
 
-if (-not (Test-Path $VenvPython)) {
-    Write-Host "[FAIL] Virtual environment Python not found:"
-    Write-Host "       $VenvPython"
-    exit 1
+Write-Info "Searching Python source for KotakNeoClient imports..."
+
+Get-ChildItem $ProjectRoot -Recurse -Filter "*.py" |
+    Where-Object {
+        $_.FullName -notmatch "\\.venv\\" -and
+        $_.FullName -notmatch "__pycache__"
+    } |
+    ForEach-Object {
+
+        $Matches = Select-String `
+            -Path $_.FullName `
+            -Pattern "KotakNeoClient|backend\.kotak_neo|backend\.broker\.kotak|from.*kotak|import.*kotak" `
+            -ErrorAction SilentlyContinue
+
+        foreach ($Match in $Matches) {
+
+            Write-Host ""
+            Write-Host "[MATCH] $($_.FullName)" -ForegroundColor Yellow
+            Write-Host "        Line $($Match.LineNumber): $($Match.Line.Trim())"
+        }
+    }
+
+# ============================================================================
+# 3. IDENTIFY WHICH CLIENT main.py USES
+# ============================================================================
+
+Write-Section "3. ACTIVE BROKER CLIENT USED BY backend/main.py"
+
+$MainFile = Join-Path $ProjectRoot "backend\main.py"
+
+if (Test-Path $MainFile) {
+
+    Write-Info "Searching main.py for Kotak imports..."
+
+    Select-String `
+        -Path $MainFile `
+        -Pattern "KotakNeoClient|kotak_neo|broker\.kotak|broker_client|auto_login|broker/login" `
+        -Context 2,2 |
+        ForEach-Object {
+
+            Write-Host ""
+            Write-Host "Line $($_.LineNumber):" -ForegroundColor Yellow
+            $_.Context.PreContext | ForEach-Object {
+                Write-Host "    $_"
+            }
+
+            Write-Host ">>> $($_.Line)" -ForegroundColor Green
+
+            $_.Context.PostContext | ForEach-Object {
+                Write-Host "    $_"
+            }
+        }
+}
+else {
+    Write-Fail "backend/main.py not found."
 }
 
-Write-Host "[OK] Python: $VenvPython"
-
-& $VenvPython --version
-
 # ============================================================================
-# 3. ENVIRONMENT FILE
+# 4. CHECK BOTH CLIENTS
 # ============================================================================
 
-Write-Host ""
-Write-Host "=============================================================================="
-Write-Host "3. ENVIRONMENT FILE"
-Write-Host "=============================================================================="
+Write-Section "4. DUPLICATE KOTAK CLIENT ANALYSIS"
+
+$SdkClient = Join-Path $ProjectRoot "backend\kotak_neo\client.py"
+$RestClient = Join-Path $ProjectRoot "backend\broker\kotak\kotak_neo_client.py"
+
+if (Test-Path $SdkClient) {
+
+    Write-Host ""
+    Write-Info "SDK WRAPPER:"
+    Write-Host "backend\kotak_neo\client.py"
+
+    $SdkContent = Get-Content $SdkClient -Raw
+
+    if ($SdkContent -match "from neo_api_client") {
+        Write-Ok "Uses neo_api_client SDK"
+    }
+
+    if ($SdkContent -match "totp_login") {
+        Write-Ok "Contains totp_login()"
+    }
+
+    if ($SdkContent -match "totp_validate") {
+        Write-Ok "Contains totp_validate()"
+    }
+
+    if ($SdkContent -match "auto_login") {
+        Write-Ok "Contains auto_login()"
+    }
+}
+
+if (Test-Path $RestClient) {
+
+    Write-Host ""
+    Write-Info "RAW REST CLIENT:"
+    Write-Host "backend\broker\kotak\kotak_neo_client.py"
+
+    $RestContent = Get-Content $RestClient -Raw
+
+    if ($RestContent -match "requests") {
+        Write-Ok "Uses raw requests HTTP client"
+    }
+
+    if ($RestContent -match "auth_token") {
+        Write-Ok "Requires externally supplied auth_token"
+    }
+
+    if ($RestContent -match "sid") {
+        Write-Ok "Requires externally supplied SID"
+    }
+
+    Write-Warn "This client does NOT appear to perform Kotak authentication itself."
+}
+
+# ============================================================================
+# 5. ENVIRONMENT FILE AUDIT
+# ============================================================================
+
+Write-Section "5. ENVIRONMENT VARIABLE AUDIT"
+
+$EnvFile = Join-Path $ProjectRoot "backend\.env"
 
 if (-not (Test-Path $EnvFile)) {
-    Write-Host "[FAIL] backend\.env not found."
-    exit 1
+
+    Write-Fail "backend\.env not found."
 }
+else {
 
-Write-Host "[OK] Found: $EnvFile"
-Write-Host "[INFO] Loading environment variables..."
+    Write-Ok "Found backend\.env"
 
-Get-Content $EnvFile | ForEach-Object {
+    $RequiredVariables = @(
+        "KOTAK_CONSUMER_KEY",
+        "KOTAK_MOBILE_NUMBER",
+        "KOTAK_UCC",
+        "KOTAK_MPIN",
+        "KOTAK_TOTP",
+        "NEO_CONSUMER_KEY"
+    )
 
-    $Line = $_.Trim()
+    $EnvContent = Get-Content $EnvFile
 
-    if (
-        $Line -and
-        -not $Line.StartsWith("#") -and
-        $Line.Contains("=")
-    ) {
-        $Parts = $Line.Split("=", 2)
+    foreach ($Variable in $RequiredVariables) {
 
-        $Name = $Parts[0].Trim()
-        $Value = $Parts[1].Trim()
+        $Line = $EnvContent |
+            Where-Object {
+                $_ -match "^\s*$Variable\s*="
+            } |
+            Select-Object -First 1
 
-        if (
-            ($Value.StartsWith('"') -and $Value.EndsWith('"')) -or
-            ($Value.StartsWith("'") -and $Value.EndsWith("'"))
-        ) {
-            $Value = $Value.Substring(1, $Value.Length - 2)
+        if ($Line) {
+
+            $Value = ($Line -split "=", 2)[1].Trim()
+
+            Write-Host "[ENV] $Variable = $(Mask-Value $Value)"
+
+            if ($Variable -eq "KOTAK_TOTP") {
+
+                Write-Host ""
+                Write-Host "[TOTP ANALYSIS]" -ForegroundColor Cyan
+
+                $CleanValue = $Value.Replace(" ", "").Trim()
+
+                if ($CleanValue -match "^\d{6}$") {
+
+                    Write-Ok "KOTAK_TOTP is currently a 6-digit numeric OTP."
+
+                    Write-Warn "A static OTP expires. Auto-login will fail after expiration."
+                }
+                elseif ($CleanValue -match "^[A-Z2-7]+=*$") {
+
+                    Write-Ok "KOTAK_TOTP appears to be Base32-compatible."
+
+                    Write-Info "Backend should convert this secret into a current 6-digit OTP before calling Kotak."
+                }
+                else {
+
+                    Write-Fail "KOTAK_TOTP is NOT a valid 6-digit numeric OTP."
+
+                    Write-Warn "It may also be an invalid/malformed Base32 secret."
+
+                    Write-Warn "This matches the Swagger error:"
+                    Write-Warn "'Invalid field Totp; must contain only numbers'"
+                }
+            }
         }
+        else {
 
-        [Environment]::SetEnvironmentVariable(
-            $Name,
-            $Value,
-            "Process"
-        )
+            Write-Warn "$Variable not present in backend\.env"
+        }
     }
 }
 
-Write-Host "[OK] .env loaded into current PowerShell process"
-
 # ============================================================================
-# 4. KOTAK CREDENTIAL VALIDATION
+# 6. LOAD DOTENV AND CHECK PYTHON ENV
 # ============================================================================
 
-Write-Host ""
-Write-Host "=============================================================================="
-Write-Host "4. KOTAK CREDENTIAL VALIDATION"
-Write-Host "=============================================================================="
+Write-Section "6. PYTHON ENVIRONMENT VISIBILITY"
 
-$RequiredVars = @(
+& $Python -c @"
+from pathlib import Path
+import os
+
+env_path = Path("backend/.env")
+
+print("ENV_PATH:", env_path.resolve())
+print("ENV_EXISTS:", env_path.exists())
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(env_path, override=True)
+
+    print("DOTENV: AVAILABLE")
+
+except Exception as exc:
+
+    print("DOTENV_ERROR:", type(exc).__name__, exc)
+
+for name in [
     "KOTAK_CONSUMER_KEY",
     "KOTAK_MOBILE_NUMBER",
     "KOTAK_UCC",
     "KOTAK_MPIN",
-    "KOTAK_TOTP"
-)
+    "KOTAK_TOTP",
+    "NEO_CONSUMER_KEY",
+]:
 
-$MissingVars = @()
+    value = os.getenv(name)
 
-foreach ($Name in $RequiredVars) {
-
-    $Value = [Environment]::GetEnvironmentVariable(
-        $Name,
-        "Process"
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Value)) {
-
-        Write-Host "[FAIL] $Name is missing"
-        $MissingVars += $Name
-    }
-    else {
-
-        if ($Value.Length -le 4) {
-            $Masked = "****"
-        }
-        else {
-            $Masked = $Value.Substring(0, 2) +
-                      ("*" * ($Value.Length - 4)) +
-                      $Value.Substring($Value.Length - 2)
-        }
-
-        Write-Host "[OK] $Name = $Masked"
-    }
-}
-
-if ($MissingVars.Count -gt 0) {
-
-    Write-Host ""
-    Write-Host "[FAIL] Missing required Kotak credentials."
-    Write-Host ""
-    exit 1
-}
+    if value:
+        print(name, "= PRESENT length=", len(value))
+    else:
+        print(name, "= MISSING")
+"@
 
 # ============================================================================
-# 5. KOTAK NEO SDK IMPORT TEST
+# 7. NEO SDK INSPECTION
 # ============================================================================
 
-Write-Host ""
-Write-Host "=============================================================================="
-Write-Host "5. KOTAK NEO SDK IMPORT"
-Write-Host "=============================================================================="
+Write-Section "7. KOTAK NEO SDK METHOD INSPECTION"
 
-$SdkTest = @'
-import sys
+& $Python -c @"
+import inspect
 
 try:
     from neo_api_client import NeoAPI
 
-    print("SUCCESS")
     print("NeoAPI:", NeoAPI)
-    sys.exit(0)
+    print()
 
-except Exception as e:
-    print("FAILED")
-    print(type(e).__name__ + ":", str(e))
-    sys.exit(1)
-'@
+    for method_name in [
+        "totp_login",
+        "totp_validate",
+        "quotes",
+        "positions",
+        "holdings",
+        "subscribe",
+        "logout",
+    ]:
 
-$SdkTest | & $VenvPython -
+        print("-" * 70)
 
-if ($LASTEXITCODE -ne 0) {
+        if hasattr(NeoAPI, method_name):
 
-    Write-Host "[FAIL] neo_api_client import failed."
-    Write-Host ""
-    Write-Host "[INFO] Checking installed packages..."
+            method = getattr(NeoAPI, method_name)
 
-    & $VenvPython -m pip list | Select-String "neo|kotak"
+            try:
+                print(method_name, inspect.signature(method))
+            except Exception as exc:
+                print(method_name, "SIGNATURE_UNAVAILABLE", exc)
 
-    Write-Host ""
-    Write-Host "[IMPORTANT]"
-    Write-Host "Do NOT run: pip install neo-api-client"
-    Write-Host "Your SDK may already be installed under a different distribution name."
-    Write-Host ""
+        else:
 
-    exit 1
-}
+            print(method_name, "NOT FOUND")
 
-Write-Host "[OK] neo_api_client is working."
+except Exception as exc:
 
-# ============================================================================
-# 6. CHECK SDK LOCATION
-# ============================================================================
-
-Write-Host ""
-Write-Host "=============================================================================="
-Write-Host "6. KOTAK SDK LOCATION"
-Write-Host "=============================================================================="
-
-$SdkLocation = @'
-import neo_api_client
-print(neo_api_client.__file__)
-'@
-
-$SdkLocation | & $VenvPython -
-
-# ============================================================================
-# 7. TEST BACKEND CLIENT IMPORT
-# ============================================================================
-
-Write-Host ""
-Write-Host "=============================================================================="
-Write-Host "7. BACKEND KOTAK CLIENT IMPORT"
-Write-Host "=============================================================================="
-
-$ClientTest = @"
-import sys
-sys.path.insert(0, r'$ProjectRoot')
-
-try:
-    from backend.kotak_neo.client import KotakNeoClient
-
-    neo = KotakNeoClient()
-
-    print("SUCCESS")
-    print("Client:", type(neo))
-    print("Connected:", neo.connected)
-
-except Exception as e:
-    import traceback
-
-    print("FAILED")
-    traceback.print_exc()
-    sys.exit(1)
+    print("SDK_INSPECTION_FAILED")
+    print(type(exc).__name__)
+    print(exc)
 "@
 
-$ClientTest | & $VenvPython -
-
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "[FAIL] backend.kotak_neo.client import failed."
-    exit 1
-}
-
-Write-Host "[OK] Backend KotakNeoClient imported successfully."
-
 # ============================================================================
-# 8. CHECK main.py LOGIN REQUEST
+# 8. CHECK LOGIN ENDPOINT IMPLEMENTATION
 # ============================================================================
 
-Write-Host ""
-Write-Host "=============================================================================="
-Write-Host "8. CHECKING LOGIN REQUEST MODEL"
-Write-Host "=============================================================================="
+Write-Section "8. /api/broker/login FORENSIC TRACE"
 
-$MainContent = Get-Content $MainFile -Raw
+if (Test-Path $MainFile) {
 
-if ($MainContent -match "ucc:\s*str") {
-    Write-Host "[OK] LoginRequest contains UCC."
-}
-else {
-    Write-Host "[WARN] LoginRequest does not appear to contain UCC."
-}
+    $Lines = Get-Content $MainFile
 
-if ($MainContent -match '"ucc":\s*req\.ucc') {
-    Write-Host "[OK] UCC is forwarded from API request."
-}
-else {
-    Write-Host "[WARN] UCC forwarding may be missing."
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+
+        if (
+            $Lines[$i] -match 'api/broker/login' -or
+            $Lines[$i] -match 'def.*broker_login'
+        ) {
+
+            Write-Host ""
+            Write-Host "[LOGIN ENDPOINT FOUND]" -ForegroundColor Yellow
+
+            $Start = [Math]::Max(0, $i - 10)
+            $End = [Math]::Min($Lines.Count - 1, $i + 80)
+
+            for ($j = $Start; $j -le $End; $j++) {
+
+                Write-Host ("{0,5}: {1}" -f ($j + 1), $Lines[$j])
+            }
+
+            break
+        }
+    }
 }
 
 # ============================================================================
-# 9. CHECK ENV FALLBACK
+# 9. CHECK TOTP TRANSFORMATION PATH
 # ============================================================================
 
-Write-Host ""
-Write-Host "=============================================================================="
-Write-Host "9. CHECKING ENVIRONMENT CREDENTIAL FALLBACK"
-Write-Host "=============================================================================="
+Write-Section "9. TOTP FLOW ANALYSIS"
 
-$ClientContent = Get-Content $ClientFile -Raw
+Write-Info "Searching for every use of TOTP..."
 
-$ExpectedEnvVars = @(
-    "KOTAK_CONSUMER_KEY",
-    "KOTAK_MOBILE_NUMBER",
-    "KOTAK_UCC",
-    "KOTAK_MPIN",
-    "KOTAK_TOTP"
-)
+Get-ChildItem $ProjectRoot -Recurse -Filter "*.py" |
+    Where-Object {
+        $_.FullName -notmatch "\\.venv\\" -and
+        $_.FullName -notmatch "__pycache__"
+    } |
+    ForEach-Object {
 
-foreach ($VarName in $ExpectedEnvVars) {
+        $Matches = Select-String `
+            -Path $_.FullName `
+            -Pattern "KOTAK_TOTP|totp_login|pyotp|TOTP\(" `
+            -ErrorAction SilentlyContinue
 
-    if ($ClientContent -match $VarName) {
-        Write-Host "[OK] $VarName referenced in client.py"
+        foreach ($Match in $Matches) {
+
+            Write-Host ""
+            Write-Host "$($_.FullName):$($Match.LineNumber)" -ForegroundColor Yellow
+            Write-Host "    $($Match.Line.Trim())"
+        }
+    }
+
+# ============================================================================
+# 10. RUNNING PYTHON / UVICORN PROCESSES
+# ============================================================================
+
+Write-Section "10. RUNNING BACKEND PROCESSES"
+
+$Processes = Get-CimInstance Win32_Process |
+    Where-Object {
+        $_.Name -match "python|uvicorn"
+    }
+
+foreach ($Process in $Processes) {
+
+    Write-Host ""
+    Write-Host "PID: $($Process.ProcessId)"
+    Write-Host "NAME: $($Process.Name)"
+    Write-Host "COMMAND:"
+    Write-Host $Process.CommandLine
+}
+
+# ============================================================================
+# 11. PORT CHECK
+# ============================================================================
+
+Write-Section "11. PORT 8000 / 5173 CHECK"
+
+foreach ($Port in @(8000, 5173)) {
+
+    Write-Info "Checking port $Port..."
+
+    $Connections = Get-NetTCPConnection `
+        -LocalPort $Port `
+        -State Listen `
+        -ErrorAction SilentlyContinue
+
+    if ($Connections) {
+
+        foreach ($Connection in $Connections) {
+
+            Write-Ok "Port $Port LISTENING"
+
+            Write-Host "PID: $($Connection.OwningProcess)"
+        }
     }
     else {
-        Write-Host "[WARN] $VarName not found in client.py"
+
+        Write-Fail "Nothing listening on port $Port"
     }
 }
 
 # ============================================================================
-# 10. DIRECT AUTO LOGIN TEST
+# 12. API HEALTH
 # ============================================================================
 
-Write-Host ""
-Write-Host "=============================================================================="
-Write-Host "10. DIRECT KOTAK AUTO LOGIN TEST"
-Write-Host "=============================================================================="
+Write-Section "12. LIVE API STATUS"
 
-Write-Host "[INFO] Testing auto_login()..."
-Write-Host "[INFO] No order will be placed."
-Write-Host ""
+$Endpoints = @(
+    "http://127.0.0.1:8000/api/health",
+    "http://127.0.0.1:8000/api/broker/status",
+    "http://127.0.0.1:8000/api/market-status"
+)
 
-$LoginTest = @"
-import os
-import sys
+foreach ($Endpoint in $Endpoints) {
+
+    Write-Host ""
+    Write-Info "GET $Endpoint"
+
+    try {
+
+        $Response = Invoke-RestMethod `
+            -Uri $Endpoint `
+            -Method GET `
+            -TimeoutSec 10
+
+        Write-Ok "Response received"
+
+        $Response |
+            ConvertTo-Json -Depth 10
+    }
+    catch {
+
+        Write-Fail $_.Exception.Message
+    }
+}
+
+# ============================================================================
+# 13. QUOTES ENDPOINT INSPECTION
+# ============================================================================
+
+Write-Section "13. /api/quotes ROOT CAUSE INSPECTION"
+
+if (Test-Path $MainFile) {
+
+    $Lines = Get-Content $MainFile
+
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+
+        if (
+            $Lines[$i] -match 'api/quotes'
+        ) {
+
+            Write-Host ""
+            Write-Host "[QUOTES ENDPOINT FOUND]" -ForegroundColor Yellow
+
+            $Start = [Math]::Max(0, $i - 10)
+            $End = [Math]::Min($Lines.Count - 1, $i + 100)
+
+            for ($j = $Start; $j -le $End; $j++) {
+
+                Write-Host ("{0,5}: {1}" -f ($j + 1), $Lines[$j])
+            }
+
+            break
+        }
+    }
+}
+
+# ============================================================================
+# 14. LIVE DATA PIPELINE IMPORT TEST
+# ============================================================================
+
+Write-Section "14. LIVE DATA PIPELINE IMPORT TEST"
+
+& $Python -c @"
 import traceback
 
-sys.path.insert(0, r'$ProjectRoot')
+modules = [
+    "backend.market.tick_normalizer",
+    "backend.market.live_quotes",
+    "backend.market.websocket_manager",
+    "backend.market.live_data_pipeline",
+]
 
-try:
-    from backend.kotak_neo.client import KotakNeoClient
-
-    neo = KotakNeoClient()
-
-    result = neo.auto_login()
-
-    print()
-    print("LOGIN_SUCCESS")
-    print(result)
-    print("CONNECTED:", neo.connected)
-
-except Exception as e:
+for module_name in modules:
 
     print()
-    print("LOGIN_FAILED")
-    print("ERROR_TYPE:", type(e).__name__)
-    print("ERROR:", str(e))
-    print()
-    traceback.print_exc()
+    print("=" * 70)
+    print("IMPORT:", module_name)
+    print("=" * 70)
 
-    sys.exit(1)
+    try:
+
+        module = __import__(
+            module_name,
+            fromlist=["*"]
+        )
+
+        print("SUCCESS:", module)
+
+    except Exception as exc:
+
+        print("FAILED:", type(exc).__name__, exc)
+
+        traceback.print_exc()
 "@
 
-$LoginTest | & $VenvPython -
+# ============================================================================
+# 15. FRONTEND API CONFIGURATION
+# ============================================================================
 
-$LoginExitCode = $LASTEXITCODE
+Write-Section "15. FRONTEND API / WEBSOCKET CONFIGURATION"
+
+$FrontendFiles = Get-ChildItem `
+    $ProjectRoot `
+    -Recurse `
+    -Include "*.ts","*.tsx","*.js","*.jsx" |
+    Where-Object {
+        $_.FullName -notmatch "\\node_modules\\" -and
+        $_.FullName -notmatch "\\.venv\\"
+    }
+
+foreach ($File in $FrontendFiles) {
+
+    $Matches = Select-String `
+        -Path $File.FullName `
+        -Pattern "/api/quotes|/api/broker|ws://|WebSocket|VITE_" `
+        -ErrorAction SilentlyContinue
+
+    foreach ($Match in $Matches) {
+
+        Write-Host ""
+        Write-Host "$($File.FullName):$($Match.LineNumber)" `
+            -ForegroundColor Yellow
+
+        Write-Host "    $($Match.Line.Trim())"
+    }
+}
 
 # ============================================================================
-# 11. FINAL REPORT
+# 16. GIT WORKTREE STATUS
 # ============================================================================
+
+Write-Section "16. GIT STATUS"
+
+git status
+
+# ============================================================================
+# FINAL
+# ============================================================================
+
+Write-Section "FORENSIC AUDIT COMPLETE"
 
 Write-Host ""
+Write-Host "IMPORTANT:" -ForegroundColor Yellow
+Write-Host ""
+Write-Host "This script DOES NOT modify:"
+Write-Host "  - Python files"
+Write-Host "  - .env"
+Write-Host "  - Git"
+Write-Host "  - Kotak credentials"
+Write-Host "  - Orders"
+Write-Host ""
+Write-Host "It only identifies the actual execution path and root causes."
+Write-Host ""
 Write-Host "=============================================================================="
-Write-Host "FINAL REPORT"
-Write-Host "=============================================================================="
-
-if ($LoginExitCode -eq 0) {
-
-    Write-Host ""
-    Write-Host "[OK] Kotak Neo login test completed successfully."
-    Write-Host ""
-    Write-Host "Your next step:"
-    Write-Host ""
-    Write-Host "    python launch.py"
-    Write-Host ""
-    Write-Host "Then verify:"
-    Write-Host ""
-    Write-Host "    http://localhost:8000/api/broker/status"
-    Write-Host ""
-}
-else {
-
-    Write-Host ""
-    Write-Host "[FAIL] Kotak Neo login failed."
-    Write-Host ""
-    Write-Host "The SDK import itself may still be working."
-    Write-Host "Review the LOGIN_FAILED error above."
-    Write-Host ""
-    Write-Host "Common causes:"
-    Write-Host "  1. Consumer key is invalid."
-    Write-Host "  2. Mobile number format is incorrect."
-    Write-Host "  3. UCC is incorrect."
-    Write-Host "  4. MPIN is incorrect."
-    Write-Host "  5. TOTP expired."
-    Write-Host "  6. TOTP secret is invalid."
-    Write-Host "  7. Kotak SDK authentication contract differs."
-    Write-Host ""
-}
-
-Write-Host "=============================================================================="
-Write-Host "DEBUG COMPLETE"
+Write-Host "NEXT: REVIEW THE OUTPUT BEFORE APPLYING ANY FIX" -ForegroundColor Cyan
 Write-Host "=============================================================================="
